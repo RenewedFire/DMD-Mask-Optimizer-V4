@@ -1,0 +1,161 @@
+{
+  "schema_version": 1,
+  "rom_revision": "twst_405",
+  "driver": "de_mSES1",
+  "hardware": "GEN_WS",
+  "width": 128,
+  "height": 32,
+  "native_shades": 4,
+  "delivery_semantics": null,
+  "rom_sha256": "7419195a51f1295e9f928e0105326cba3c4e32b9b2d3b59c004f773d132707a3",
+  "dump_sha256": "f711aec5d42fdc423ca02bfd2c8f05c158afaee27a97acdbf59d532b81095b11",
+  "rom_members": [
+    {
+      "name": "twstcpu.405",
+      "size": 131072,
+      "crc32": "8c3ea1a8",
+      "sha256": "67df98c173449ee1dbd2a399f4652d37131b984ebbafe571807711d6e1287df8"
+    },
+    {
+      "name": "twstdspa.400",
+      "size": 524288,
+      "crc32": "a6a3d41d",
+      "sha256": "ab7169db9ec63bad1c31baafa05af9d53b937374abaa5d886a46cbe33435d4c7"
+    },
+    {
+      "name": "twstsnd.u17",
+      "size": 524288,
+      "crc32": "0e35d640",
+      "sha256": "0a9a573949e169308db915baa68a96f53aba1c46f052023c69fd9a2987d5803d"
+    },
+    {
+      "name": "twstsnd.u21",
+      "size": 524288,
+      "crc32": "c3eae590",
+      "sha256": "9ca6f9e8ab16160bdc699ea7883fd2dc855170b7fefd0bafe333c274e5a4d193"
+    },
+    {
+      "name": "twstsnd.u7",
+      "size": 65536,
+      "crc32": "5ccf0798",
+      "sha256": "7c71e9314a483941ccd3c450a17b6bd135646d824635f3e43b90a1d9a784368f"
+    }
+  ],
+  "components": {
+    "ColorizingDMD editor": {
+      "source_repository": "https://github.com/SerumColor/ColorizingDMD",
+      "source_commit": "37216912eecfb0cebf1e8c2e816d350d33f5e62d",
+      "release_tag": "v3.17.3",
+      "release_url": "https://github.com/SerumColor/ColorizingDMD/releases/tag/v3.17.3",
+      "release_archive": "ColorizingDMD.zip",
+      "release_archive_sha256": null,
+      "binary": "editor/ColorizingDMD.exe",
+      "sha256": "daf356ffae699ca830d6b2bdc3ffe2791908789f0d5671c2f8f448151b6caaa7",
+      "architecture": "x64",
+      "compiler": "locally installed vendor binary; build toolchain unavailable",
+      "build_command": "not available from local installation",
+      "compiler_flags": [
+        "unavailable from local installation"
+      ],
+      "linker_flags": [
+        "/SUBSYSTEM:WINDOWS",
+        "/STACK:3000000",
+        "/OPT:REF",
+        "/OPT:ICF",
+        "/LTCG:incremental",
+        "/DYNAMICBASE",
+        "/NXCOMPAT",
+        "/MACHINE:X64"
+      ],
+      "dependencies": {
+        "editor/cargs64.dll": "d97f3ed5b67fefd92a1658cca5521a169c4d9957a4161edafa71d4abe348dfce",
+        "editor/giflib5.dll": "8bd227fe5312e24dfe70d87204f90249ea87f1577bf816c0c1a5e82b8443f1a5",
+        "editor/gifski.dll": "20b5a9019f9273e80895a91ac23f6af0cf14e5e007fbe93017c16b1e7edba368",
+        "editor/glew32.dll": "eabb3dfec3a95f0282f10f5ba4b633e681aa5aff19995cad069e6e954a9cea12",
+        "editor/glfw3.dll": "59298bc897b077422aa2ff1d3f41f6204fdf40430eb675a72f34ba38a4d09633",
+        "editor/libcurl.dll": "b5abe811c788332c991ea947df2186d5da87406f5c1b4ec3c6d0a2cb89117986",
+        "editor/libserialport64.dll": "2759f81220e48f2fcf48d203a88404e7267c7c9b4232def367e23976993447e8",
+        "editor/LiteZip.dll": "a647b71bb58a413569e18962aa04887775cf3d155fd8ed8f545dd68faa175e8c",
+        "editor/opencv_core451.dll": "41e00fe421fb162e81f248bcbd27e39f95a851d7a30dbf74ed880bfdc79cb5d2",
+        "editor/opencv_imgcodecs451.dll": "98eb0df02a6001b51e2944a059b6b0a3c79addd664d1ac2078848aeb65e0ee27",
+        "editor/opencv_imgproc451.dll": "d199aaabb5bb91401191aaa6e79e4cef494003930c17e104e1a0e4d29d8587bc",
+        "editor/opencv_videoio451.dll": "4de1400e1b0e2496640c127ed0b9598c2b7815a57b0f776bc25a7e43bcac62cf",
+        "editor/opencv_videoio_ffmpeg451_64.dll": "e5b3be3fa9d73ff07b3b78bb97bab21b8628315a2d8efcdbce36179a11333a4d",
+        "editor/sockpp64.dll": "b9d06d1152d53103c5a069a3c8a5bb498dc733a25fbe857303c646453303a449",
+        "editor/zedmd64.dll": "1e5fde7bf5a7e399c702b4831623f77528cff071383a57a4fb8186aa12475b58"
+      },
+      "pending": [],
+      "provenance": {
+        "kind": "local-installation",
+        "installation_path": "C:\\vPinball\\ColorizingDMD"
+      }
+    },
+    "bundled decoder": {
+      "source_repository": "https://github.com/SerumColor/ColorizingDMD",
+      "source_commit": "37216912eecfb0cebf1e8c2e816d350d33f5e62d",
+      "release_tag": "v3.17.3",
+      "release_url": "https://github.com/SerumColor/ColorizingDMD/releases/tag/v3.17.3",
+      "release_archive": "ColorizingDMD.zip",
+      "release_archive_sha256": null,
+      "source_path": "serum-decode.cpp",
+      "source_version": "unavailable from local installation",
+      "source_tree_binary_git_blob": "311bdb7b1d552d9ef0a2db11a11161df761b1dc4",
+      "source_tree_binary_sha256": "da71fa73e838ab3e257a2a73c8f74d88a3336615930761fa494a251822e0c2d5",
+      "source_tree_binary_version": "2.1.0",
+      "binary": "editor/serum64.dll",
+      "sha256": "37df5ee09c4dc9373524a48685c844f19af624e8cfcde67900456bcc6ba18221",
+      "architecture": "x64",
+      "binary_version": "2.5.2",
+      "compiler": "locally installed vendor binary; build toolchain unavailable",
+      "build_command": "not available from local installation",
+      "compiler_flags": [
+        "unavailable from local installation"
+      ],
+      "dependencies": {},
+      "pending": [],
+      "provenance": {
+        "kind": "local-installation",
+        "installation_path": "C:\\vPinball\\VisualPinball\\VPinMAME"
+      }
+    },
+    "PinMAME 3.6": {
+      "source_repository": "https://github.com/vpinball/pinmame",
+      "source_commit": "ecd032e55481b261cce4820b53fd28fe478c70b4",
+      "release_tag": "v3.6.0-1227-ecd032e",
+      "release_url": "https://github.com/vpinball/pinmame/releases/tag/v3.6.0-1227-ecd032e",
+      "release_archive": "VPinMAME36_Minimal.zip",
+      "release_archive_sha256": null,
+      "source_build_workflow": ".github/workflows/vpinmame.yml",
+      "binary": "pinmame/VPinMAME64.dll",
+      "sha256": "69ebacabdb7e1af0533142a8456341f06e9d4b6cb3dc4649f18794be456ea8c1",
+      "architecture": "x64",
+      "binary_version": "3.6.0.1227.ecd032e",
+      "compiler": "GitHub Actions windows-2019, Visual Studio 2019 generator with MSVC v141_xp; PE linker 14.16",
+      "build_command": "Copy-Item cmake/vpinmame/CMakeLists_win-x64.txt CMakeLists.txt\ncmake -T v141_xp -G 'Visual Studio 16 2019' -A x64 -B build/vpinmame\ncmake --build build/vpinmame --config Release",
+      "compiler_flags": [
+        "/Ob2",
+        "/O2",
+        "/Oi",
+        "/fp:fast",
+        "/fp:except-",
+        "/Ot",
+        "/GF",
+        "/GS-",
+        "/Gy",
+        "/GR-",
+        "/Oy",
+        "/GT",
+        "/GL",
+        "/EHsc"
+      ],
+      "dependencies": {
+        "pinmame/Bass64.dll": "94ff6f6d935292b6664779b06ddd6a63db274c962dc15e18723f9a46c5529d4f"
+      },
+      "pending": [],
+      "provenance": {
+        "kind": "local-installation",
+        "installation_path": "C:\\vPinball\\VisualPinball\\VPinMAME"
+      }
+    }
+  }
+}
