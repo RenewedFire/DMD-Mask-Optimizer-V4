@@ -1,0 +1,14 @@
+# Local ROM and capture fixtures
+twst_405.zip
+twst_405.txt
+
+# Development and qualification outputs
+.superpowers/
+.worktrees/
+artifacts/
+build/
+dist/
+*.egg-info/
+__pycache__/
+.pytest_cache/
+.venv/
