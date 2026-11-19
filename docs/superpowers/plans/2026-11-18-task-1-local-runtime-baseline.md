@@ -101,7 +101,7 @@ toolchain; do not modify their source files under `C:\vPinball`.
 - [ ] **Step 4: Run the full suite and native lock**
 
 Run: `DMD_PROFILE_LOCAL=1 python -m pytest -q` and
-`python scripts/lock_profile.py --rom twst_405.zip --dump twst_405.txt --toolchain artifacts/2026-11-18-task-1-fix-3/toolchain`.
+`python scripts/lock_profile.py --rom twst_405.zip --dump twst_405.txt --toolchain artifacts/2026-11-18-task-1-fix-3/toolchain --scope local-runtime`.
 
 Expected: tests pass and the local-runtime lock emits `local_runtime_verified: true`, `authoring_binaries_verified: false`, and `native_binaries_verified: false`. A separate staged `--scope authoring` run is required before authoring parity can be asserted.
 
