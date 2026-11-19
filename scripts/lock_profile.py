@@ -312,9 +312,10 @@ def _file_version(path, name):
 
 def _verify_binary(path, lock, name):
     _check_sha256(path, lock["sha256"], name)
-    architecture = _architecture(path, name)
-    if architecture != lock["architecture"]:
-        raise ProfileError(f"{name}: architecture mismatch for {path}; expected {lock['architecture']}, got {architecture}")
+    if "architecture" in lock:
+        architecture = _architecture(path, name)
+        if architecture != lock["architecture"]:
+            raise ProfileError(f"{name}: architecture mismatch for {path}; expected {lock['architecture']}, got {architecture}")
     if "file_version" in lock:
         version = _file_version(path, name)
         if version != lock["file_version"]:

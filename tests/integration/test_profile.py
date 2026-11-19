@@ -56,7 +56,8 @@ def case(tmp_path, monkeypatch):
     decoder['file_version'] = '2.1.0.0'
     for name, dependency in [('ColorizingDMD editor', 'editor/LiteZip.dll'), ('PinMAME 3.6', 'pinmame/Bass64.dll')]:
         target = toolchain / dependency
-        target.write_bytes(b'synthetic dependency')
+        target.parent.mkdir(parents=True, exist_ok=True)
+        write_pe(target)
         lock = {'sha256': sha256(target), 'architecture': 'x64', 'file_version': '9.9.9.9'} if name == 'PinMAME 3.6' else sha256(target)
         profile['components'][name]['dependencies'][dependency] = lock
 
@@ -233,7 +234,7 @@ def test_names_changed_dependency(case):
     rom, dump, toolchain, profile, save_profile = case
     dependency = 'pinmame/Bass64.dll'
     target = toolchain / dependency
-    target.write_bytes(b'original')
+    write_pe(target)
     profile['components']['PinMAME 3.6']['dependencies'][dependency] = {'sha256': sha256(target), 'architecture': 'x64', 'file_version': '9.9.9.9'}
     save_profile()
     assert module.lock_profile(rom, dump, toolchain).local_runtime_verified
