@@ -328,8 +328,10 @@ def _verify_component(name, component, toolchain):
         raise ProfileError(f"{name}: missing provenance: {', '.join(component['pending'])}")
 
 
-def lock_profile(rom: Path, dump: Path, toolchain: Path) -> Profile:
-    """Lock local runtime independently from the original editor/decoder authoring lock."""
+def lock_profile(rom: Path, dump: Path, toolchain: Path, scope="local-runtime") -> Profile:
+    """Verify one explicit lock scope without treating local runtime as editor parity."""
+    if scope not in {"authoring", "local-runtime"}:
+        raise ProfileError(f"unknown lock scope {scope!r}")
     profile = inspect_fixtures(rom, dump)
     scope_errors = {"authoring": [], "local-runtime": []}
     for name, component in profile.components.items():
@@ -337,8 +339,8 @@ def lock_profile(rom: Path, dump: Path, toolchain: Path) -> Profile:
             _verify_component(name, component, toolchain)
         except ProfileError as exc:
             scope_errors[component["verification_scope"]].append(str(exc))
-    if scope_errors["local-runtime"]:
-        raise ProfileError("\n".join(scope_errors["local-runtime"]))
+    if scope_errors[scope]:
+        raise ProfileError("\n".join(scope_errors[scope]))
     authoring_verified = not scope_errors["authoring"]
     return replace(profile, authoring_binaries_verified=authoring_verified,
                    local_runtime_verified=True,
@@ -351,12 +353,14 @@ def main(argv=None):
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--toolchain", type=Path, help="directory containing the locked Windows binaries")
     mode.add_argument("--fixtures-only", action="store_true", help="check the ROM and dump without native binaries")
+    parser.add_argument("--scope", choices=("authoring", "local-runtime"), default="local-runtime",
+                        help="native lock scope; local runtime does not assert editor parity")
     args = parser.parse_args(argv)
     try:
         if args.fixtures_only:
             profile = inspect_fixtures(args.rom, args.dump)
         else:
-            profile = lock_profile(args.rom, args.dump, args.toolchain)
+            profile = lock_profile(args.rom, args.dump, args.toolchain, args.scope)
     except ProfileError as exc:
         print(exc, file=sys.stderr)
         return 1
