@@ -290,7 +290,7 @@ def test_rejects_x86_bass_even_when_its_sha_is_updated(case):
     write_pe(target, machine=0x014C)
     profile['components']['PinMAME 3.6']['dependencies'][dependency]['sha256'] = sha256(target)
     save_profile()
-    with pytest.raises(module.ProfileError, match=r'Bass64\\.dll.*architecture.*x64.*x86'):
+    with pytest.raises(module.ProfileError, match=r'Bass64\.dll.*architecture.*x64.*x86'):
         module.lock_profile(rom, dump, toolchain, 'local-runtime')
 
 
