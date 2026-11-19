@@ -50,13 +50,25 @@ def case(tmp_path, monkeypatch):
         record.update(architecture='x64', sha256=sha256(target),
                       build_command=f'Build-Synthetic {name}', compiler='Synthetic Compiler 1.0',
                       compiler_flags=['/O2'], dependencies={}, pending=[],
-                      release_archive_sha256='f' * 64)
+                      release_archive_sha256='f' * 64,
+                      verification_scope='authoring' if name in {'ColorizingDMD editor', 'bundled decoder'} else 'local-runtime')
     decoder = profile['components']['bundled decoder']
     decoder['binary_version'] = decoder['source_version']
     for name, dependency in [('ColorizingDMD editor', 'editor/LiteZip.dll'), ('PinMAME 3.6', 'pinmame/Bass64.dll')]:
         target = toolchain / dependency
         target.write_bytes(b'synthetic dependency')
-        profile['components'][name]['dependencies'][dependency] = sha256(target)
+        lock = {'sha256': sha256(target), 'architecture': 'x64', 'binary_version': '9.9.9.9'} if name == 'PinMAME 3.6' else sha256(target)
+        profile['components'][name]['dependencies'][dependency] = lock
+
+    def synthetic_file_version(path, name):
+        if 'Bass64.dll' in str(path):
+            return '9.9.9.9'
+        for record in profile['components'].values():
+            if str(path).endswith(record['binary'].replace('/', os.sep)):
+                return record.get('binary_version', '0.0.0.0')
+        raise AssertionError(f'unexpected version lookup: {path}')
+
+    monkeypatch.setattr(module, '_file_version', synthetic_file_version)
 
     def save_profile():
         profile_path.write_text(json.dumps(profile), encoding='utf-8')
@@ -77,6 +89,8 @@ def test_profile(case):
         for item in profile['rom_members']
     ]
     assert (locked.width, locked.height, locked.native_shades) == (128, 32, 4)
+    assert locked.authoring_binaries_verified
+    assert locked.local_runtime_verified
     assert locked.native_binaries_verified
     assert locked.profile_sha256 == module.lock_profile(rom, dump, toolchain).profile_sha256
 
@@ -219,9 +233,9 @@ def test_names_changed_dependency(case):
     dependency = 'pinmame/Bass64.dll'
     target = toolchain / dependency
     target.write_bytes(b'original')
-    profile['components']['PinMAME 3.6']['dependencies'][dependency] = sha256(target)
+    profile['components']['PinMAME 3.6']['dependencies'][dependency] = {'sha256': sha256(target), 'architecture': 'x64', 'binary_version': '9.9.9.9'}
     save_profile()
-    assert module.lock_profile(rom, dump, toolchain).native_binaries_verified
+    assert module.lock_profile(rom, dump, toolchain).local_runtime_verified
     target.write_bytes(b'changed')
     with pytest.raises(module.ProfileError, match=r'PinMAME 3\.6 dependency .*Bass64\.dll.*SHA-256'):
         module.lock_profile(rom, dump, toolchain)
@@ -268,7 +282,35 @@ def test_rejects_local_installation_without_absolute_path(case):
         module.inspect_fixtures(*case[:2])
 
 
-@pytest.mark.skipif(os.environ.get('DMD_PROFILE_LOCAL') != '1', reason='requires local fixtures')
+def test_rejects_x86_bass_even_when_its_sha_is_updated(case):
+    rom, dump, toolchain, profile, save_profile = case
+    dependency = 'pinmame/Bass64.dll'
+    target = toolchain / dependency
+    write_pe(target, machine=0x014C)
+    profile['components']['PinMAME 3.6']['dependencies'][dependency]['sha256'] = sha256(target)
+    save_profile()
+    with pytest.raises(module.ProfileError, match=r'Bass64\\.dll.*architecture.*x64.*x86'):
+        module.lock_profile(rom, dump, toolchain, 'local-runtime')
+
+
+def test_local_runtime_scope_never_claims_authoring_parity(case):
+    rom, dump, toolchain, profile, save_profile = case
+    (toolchain / profile['components']['bundled decoder']['binary']).unlink()
+    save_profile()
+    locked = module.lock_profile(rom, dump, toolchain, 'local-runtime')
+    assert locked.local_runtime_verified
+    assert not locked.authoring_binaries_verified
+    assert not locked.native_binaries_verified
+
+
+def test_authoring_scope_rejects_missing_bundled_decoder(case):
+    rom, dump, toolchain, profile, _ = case
+    (toolchain / profile['components']['bundled decoder']['binary']).unlink()
+    with pytest.raises(module.ProfileError, match='bundled decoder.*missing'):
+        module.lock_profile(rom, dump, toolchain, 'authoring')
+
+
+@pytest.mark.skipif(os.environ.get('DMD_LOCAL_RUNTIME') != '1', reason='requires local fixtures')
 def test_local_twister_fixture():
     case = module.inspect_fixtures(ROOT / 'twst_405.zip', ROOT / 'twst_405.txt')
     assert case.rom_sha256 == '7419195a51f1295e9f928e0105326cba3c4e32b9b2d3b59c004f773d132707a3' and case.dump_sha256 == 'f711aec5d42fdc423ca02bfd2c8f05c158afaee27a97acdbf59d532b81095b11'.lower()
@@ -282,4 +324,5 @@ def test_local_runtime_baseline_locks_twister_fixture():
         ROOT / 'twst_405.txt',
         ROOT / 'artifacts' / '2026-11-18-task-1-fix-3' / 'toolchain',
     )
-    assert profile.native_binaries_verified
+    assert profile.local_runtime_verified
+    assert not profile.native_binaries_verified
