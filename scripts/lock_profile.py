@@ -168,7 +168,7 @@ def _validate_component(name, record):
     _field(record, "compiler_flags", lambda value: (_string_list(value) and bool(value))
            or (bool(pending) and value is None), "a nonempty list of compiler flags or null while provenance is pending", name)
     _field(record, "release_archive_sha256",
-           lambda value: _hex(value, 64) or (value is None and (bool(pending) or local_installation)),
+           lambda value: _hex(value, 64) or (value is None and (bool(pending) or local_installation or record.get("provenance", {}).get("kind") == "source-tree")),
            "a lowercase SHA-256 digest or null while provenance is pending or locally installed", name)
 
     dependencies = _field(record, "dependencies", lambda value: isinstance(value, dict), "an object", name)
