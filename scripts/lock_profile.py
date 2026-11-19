@@ -13,7 +13,7 @@ from pathlib import Path
 
 PROFILE_PATH = Path(__file__).resolve().parents[1] / "profiles" / "twst_405.json"
 PE_ARCHITECTURES = {0x014C: "x86", 0x8664: "x64", 0xAA64: "arm64"}
-REQUIRED_COMPONENTS = ("ColorizingDMD editor", "bundled decoder", "PinMAME 3.6")
+REQUIRED_COMPONENTS = ("ColorizingDMD editor", "bundled decoder", "PinMAME 3.6", "local Serum runtime")
 
 
 class ProfileError(ValueError):
@@ -42,6 +42,8 @@ class Profile:
     rom_members: tuple[RomMember, ...]
     components: dict[str, dict]
     profile_sha256: str
+    authoring_binaries_verified: bool = False
+    local_runtime_verified: bool = False
     native_binaries_verified: bool = False
 
 
@@ -132,11 +134,15 @@ def _validate_provenance(record, name):
     if not isinstance(provenance, dict):
         raise ProfileError(f"{name}: invalid provenance; expected an object")
     kind = _field(provenance, "kind", _nonempty_string, "a nonempty string", f"{name} provenance")
-    if kind != "local-installation":
-        raise ProfileError(f"{name}: invalid provenance kind {kind!r}; expected 'local-installation'")
-    _field(provenance, "installation_path", _windows_absolute_path,
-           "an absolute Windows path", f"{name} provenance")
-    return True
+    if kind == "local-installation":
+        _field(provenance, "installation_path", _windows_absolute_path,
+               "an absolute Windows path", f"{name} provenance")
+        return True
+    if kind == "source-tree":
+        _field(provenance, "source_tree_binary_git_blob", lambda value: _hex(value, 40),
+               "a full lowercase Git blob ID", f"{name} provenance")
+        return False
+    raise ProfileError(f"{name}: invalid provenance kind {kind!r}; expected 'local-installation' or 'source-tree'")
 
 
 def _validate_component(name, record):
@@ -146,6 +152,11 @@ def _validate_component(name, record):
     _field(record, "sha256", lambda value: _hex(value, 64), "a lowercase SHA-256 digest", name)
     _field(record, "architecture", lambda value: isinstance(value, str) and value in PE_ARCHITECTURES.values(),
            "x86, x64 or arm64", name)
+    _field(record, "verification_scope", lambda value: value in {"authoring", "local-runtime"},
+           "'authoring' or 'local-runtime'", name)
+    if "file_version" in record:
+        _field(record, "file_version", lambda value: isinstance(value, str) and re.fullmatch(r"\d+\.\d+\.\d+\.\d+", value) is not None,
+               "a numeric a.b.c.d file version", name)
     _field(record, "source_commit", lambda value: _hex(value, 40), "a full lowercase Git commit ID", name)
     for field in ("source_repository", "release_tag", "release_url", "release_archive"):
         _field(record, field, _nonempty_string, "a nonempty string", name)
@@ -158,24 +169,31 @@ def _validate_component(name, record):
     _field(record, "compiler_flags", lambda value: (_string_list(value) and bool(value))
            or (bool(pending) and value is None), "a nonempty list of compiler flags or null while provenance is pending", name)
     _field(record, "release_archive_sha256",
-           lambda value: _hex(value, 64) or (value is None and (bool(pending) or local_installation)),
+           lambda value: _hex(value, 64) or (value is None and (bool(pending) or local_installation or record.get("provenance", {}).get("kind") == "source-tree")),
            "a lowercase SHA-256 digest or null while provenance is pending or locally installed", name)
 
     dependencies = _field(record, "dependencies", lambda value: isinstance(value, dict), "an object", name)
     if name in {"ColorizingDMD editor", "PinMAME 3.6"} and not dependencies:
         raise ProfileError(f"{name}: missing dependencies; expected a nonempty runtime dependency lock")
-    for path, digest in dependencies.items():
+    for path, lock in dependencies.items():
         if not _toolchain_path(path):
             raise ProfileError(f"{name}: invalid dependencies path {path!r}; expected a relative toolchain path")
+        digest = lock if isinstance(lock, str) else lock.get("sha256") if isinstance(lock, dict) else None
         if not _hex(digest, 64):
             raise ProfileError(f"{name}: invalid dependencies hash for {path}; expected a lowercase SHA-256 digest")
+        if isinstance(lock, dict):
+            _field(lock, "architecture", lambda value: value in PE_ARCHITECTURES.values(),
+                   "x86, x64 or arm64", f"{name} dependency {path}")
+            _field(lock, "file_version", lambda value: isinstance(value, str) and re.fullmatch(r"\d+\.\d+\.\d+\.\d+", value) is not None,
+                   "a numeric a.b.c.d file version", f"{name} dependency {path}")
 
 
 def _validate_profile(record):
     name = "profile"
     if not isinstance(record, dict):
         raise ProfileError("profile: expected an object")
-    _field(record, "schema_version", lambda value: type(value) is int and value == 1, "version 1", name)
+    _field(record, "schema_version", lambda value: type(value) is int and value == 2, "version 2", name)
+    _field(record, "lock_scopes", lambda value: isinstance(value, dict), "an object", name)
     for field in ("rom_revision", "driver", "hardware"):
         _field(record, field, _nonempty_string, "a nonempty string", name)
     for field in ("width", "height", "native_shades"):
@@ -201,9 +219,9 @@ def _validate_profile(record):
         if decoder[field] != editor[field]:
             raise ProfileError(f"{name}: {field} differs from ColorizingDMD editor")
     source_version = _field(decoder, "source_version", _nonempty_string, "a nonempty string", name)
-    binary_version = _field(decoder, "binary_version", _nonempty_string, "a nonempty string", name)
-    if source_version != binary_version and not decoder["pending"] and not _local_installation(decoder):
-        raise ProfileError(f"{name}: binary_version {binary_version} differs from source_version {source_version}")
+    source_tree_version = _field(decoder, "source_tree_binary_version", _nonempty_string, "a nonempty string", name)
+    if decoder.get("provenance", {}).get("kind") == "source-tree" and source_version != source_tree_version:
+        raise ProfileError(f"{name}: source_version {source_version} differs from source_tree_binary_version {source_tree_version}")
 
 
 def _manifest_members(records):
@@ -273,32 +291,66 @@ def _architecture(path, name):
     raise ProfileError(f"{name}: invalid Windows PE header in {path}")
 
 
+def _file_version(path, name):
+    """Read the Windows VERSIONINFO FileVersion without third-party packages."""
+    if sys.platform != "win32":
+        raise ProfileError(f"{name}: Windows file-version verification requires Windows")
+    import ctypes
+    size = ctypes.windll.version.GetFileVersionInfoSizeW(str(path), None)
+    if not size:
+        raise ProfileError(f"{name}: missing Windows VERSIONINFO in {path}")
+    data = ctypes.create_string_buffer(size)
+    if not ctypes.windll.version.GetFileVersionInfoW(str(path), 0, size, data):
+        raise ProfileError(f"{name}: cannot read Windows VERSIONINFO from {path}")
+    value, length = ctypes.c_void_p(), ctypes.c_uint()
+    if not ctypes.windll.version.VerQueryValueW(data, "\\\\", ctypes.byref(value), ctypes.byref(length)):
+        raise ProfileError(f"{name}: invalid Windows VERSIONINFO in {path}")
+    info = ctypes.cast(value, ctypes.POINTER(ctypes.c_uint32 * 13)).contents
+    ms, ls = info[2], info[3]
+    return f"{ms >> 16}.{ms & 0xffff}.{ls >> 16}.{ls & 0xffff}"
+
+
+def _verify_binary(path, lock, name):
+    _check_sha256(path, lock["sha256"], name)
+    if "architecture" in lock:
+        architecture = _architecture(path, name)
+        if architecture != lock["architecture"]:
+            raise ProfileError(f"{name}: architecture mismatch for {path}; expected {lock['architecture']}, got {architecture}")
+    if "file_version" in lock:
+        version = _file_version(path, name)
+        if version != lock["file_version"]:
+            raise ProfileError(f"{name}: file-version mismatch for {path}; expected {lock['file_version']}, got {version}")
+
+
 def _verify_component(name, component, toolchain):
-    path = toolchain / component["binary"]
-    _check_sha256(path, component["sha256"], name)
-    architecture = _architecture(path, name)
-    expected = component["architecture"]
-    if architecture != expected:
-        raise ProfileError(f"{name}: architecture mismatch for {path}; expected {expected}, got {architecture}")
-    for relative_path, sha256 in component["dependencies"].items():
-        _check_sha256(toolchain / relative_path, sha256, f"{name} dependency {relative_path}")
+    _verify_binary(toolchain / component["binary"], component, name)
+    for relative_path, lock in component["dependencies"].items():
+        dependency = lock if isinstance(lock, dict) else {"sha256": lock}
+        _verify_binary(toolchain / relative_path, dependency, f"{name} dependency {relative_path}")
     if component["pending"]:
         raise ProfileError(f"{name}: missing provenance: {', '.join(component['pending'])}")
 
 
-def lock_profile(rom: Path, dump: Path, toolchain: Path) -> Profile:
-    """Require the exact Twister fixture and pinned native binaries under toolchain."""
+def lock_profile(rom: Path, dump: Path, toolchain: Path, scope="local-runtime") -> Profile:
+    """Verify one explicit lock scope without treating local runtime as editor parity."""
+    if scope not in {"authoring", "local-runtime"}:
+        raise ProfileError(f"unknown lock scope {scope!r}")
     profile = inspect_fixtures(rom, dump)
-    errors = []
+    scope_errors = {"authoring": [], "local-runtime": []}
     for name, component in profile.components.items():
         try:
             _verify_component(name, component, toolchain)
         except ProfileError as exc:
-            errors.append(str(exc))
-    if errors:
-        raise ProfileError("\n".join(errors))
-    return replace(profile, native_binaries_verified=True)
-
+            scope_errors[component["verification_scope"]].append(str(exc))
+    if scope_errors[scope]:
+        raise ProfileError("\n".join(scope_errors[scope]))
+    # The unselected scope is deliberately *unverified*, even if its files happen
+    # to be present: callers must make a separate explicit assertion.
+    authoring_verified = scope == "authoring"
+    local_runtime_verified = scope == "local-runtime"
+    return replace(profile, authoring_binaries_verified=authoring_verified,
+                   local_runtime_verified=local_runtime_verified,
+                   native_binaries_verified=False)
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
@@ -307,12 +359,14 @@ def main(argv=None):
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--toolchain", type=Path, help="directory containing the locked Windows binaries")
     mode.add_argument("--fixtures-only", action="store_true", help="check the ROM and dump without native binaries")
+    parser.add_argument("--scope", choices=("authoring", "local-runtime"), default="local-runtime",
+                        help="native lock scope; local runtime does not assert editor parity")
     args = parser.parse_args(argv)
     try:
         if args.fixtures_only:
             profile = inspect_fixtures(args.rom, args.dump)
         else:
-            profile = lock_profile(args.rom, args.dump, args.toolchain)
+            profile = lock_profile(args.rom, args.dump, args.toolchain, args.scope)
     except ProfileError as exc:
         print(exc, file=sys.stderr)
         return 1
