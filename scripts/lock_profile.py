@@ -304,8 +304,9 @@ def _file_version(path, name):
     value, length = ctypes.c_void_p(), ctypes.c_uint()
     if not ctypes.windll.version.VerQueryValueW(data, "\\\\", ctypes.byref(value), ctypes.byref(length)):
         raise ProfileError(f"{name}: invalid Windows VERSIONINFO in {path}")
-    info = ctypes.cast(value, ctypes.POINTER(ctypes.c_ushort * 26)).contents
-    return ".".join(str(part) for part in (info[4], info[5], info[6], info[7]))
+    info = ctypes.cast(value, ctypes.POINTER(ctypes.c_uint32 * 13)).contents
+    ms, ls = info[2], info[3]
+    return f"{ms >> 16}.{ms & 0xffff}.{ls >> 16}.{ls & 0xffff}"
 
 
 def _verify_binary(path, lock, name):
