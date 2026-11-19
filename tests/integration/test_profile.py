@@ -206,7 +206,7 @@ def test_rejects_decoder_source_from_another_commit(case):
 def test_decoder_version_mismatch_remains_unavailable_without_pending_notice(case):
     _, _, _, profile, save_profile = case
     profile['components']['bundled decoder']['source_version'] = '2.2.0'
-    del profile['components']['bundled decoder']['provenance']
+    assert profile['components']['bundled decoder']['provenance']['kind'] == 'source-tree'
     save_profile()
     with pytest.raises(module.ProfileError, match='bundled decoder.*source_version.*source_tree_binary_version'):
         module.lock_profile(*case[:3])
