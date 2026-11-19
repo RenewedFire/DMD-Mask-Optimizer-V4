@@ -53,11 +53,11 @@ def case(tmp_path, monkeypatch):
                       release_archive_sha256='f' * 64,
                       verification_scope='authoring' if name in {'ColorizingDMD editor', 'bundled decoder'} else 'local-runtime')
     decoder = profile['components']['bundled decoder']
-    decoder['binary_version'] = decoder['source_version']
+    decoder['file_version'] = '2.1.0.0'
     for name, dependency in [('ColorizingDMD editor', 'editor/LiteZip.dll'), ('PinMAME 3.6', 'pinmame/Bass64.dll')]:
         target = toolchain / dependency
         target.write_bytes(b'synthetic dependency')
-        lock = {'sha256': sha256(target), 'architecture': 'x64', 'binary_version': '9.9.9.9'} if name == 'PinMAME 3.6' else sha256(target)
+        lock = {'sha256': sha256(target), 'architecture': 'x64', 'file_version': '9.9.9.9'} if name == 'PinMAME 3.6' else sha256(target)
         profile['components'][name]['dependencies'][dependency] = lock
 
     def synthetic_file_version(path, name):
@@ -65,7 +65,7 @@ def case(tmp_path, monkeypatch):
             return '9.9.9.9'
         for record in profile['components'].values():
             if str(path).endswith(record['binary'].replace('/', os.sep)):
-                return record.get('binary_version', '0.0.0.0')
+                return record.get('file_version', '0.0.0.0')
         raise AssertionError(f'unexpected version lookup: {path}')
 
     monkeypatch.setattr(module, '_file_version', synthetic_file_version)
@@ -89,9 +89,9 @@ def test_profile(case):
         for item in profile['rom_members']
     ]
     assert (locked.width, locked.height, locked.native_shades) == (128, 32, 4)
-    assert locked.authoring_binaries_verified
+    assert not locked.authoring_binaries_verified
     assert locked.local_runtime_verified
-    assert locked.native_binaries_verified
+    assert not locked.native_binaries_verified
     assert locked.profile_sha256 == module.lock_profile(rom, dump, toolchain).profile_sha256
 
 
@@ -205,10 +205,10 @@ def test_rejects_decoder_source_from_another_commit(case):
 
 def test_decoder_version_mismatch_remains_unavailable_without_pending_notice(case):
     _, _, _, profile, save_profile = case
-    profile['components']['bundled decoder']['binary_version'] = '2.2.0'
+    profile['components']['bundled decoder']['source_version'] = '2.2.0'
     del profile['components']['bundled decoder']['provenance']
     save_profile()
-    with pytest.raises(module.ProfileError, match='bundled decoder.*binary_version.*source_version'):
+    with pytest.raises(module.ProfileError, match='bundled decoder.*source_version.*source_tree_binary_version'):
         module.lock_profile(*case[:3])
 
 
@@ -270,7 +270,7 @@ def test_accepts_explicit_local_installation_provenance(case):
             'installation_path': r'C:\\vPinball\\VisualPinball\\VPinMAME',
         }
     save_profile()
-    assert module.lock_profile(rom, dump, toolchain).native_binaries_verified
+    assert not module.lock_profile(rom, dump, toolchain).native_binaries_verified
 
 
 def test_rejects_local_installation_without_absolute_path(case):
@@ -281,6 +281,15 @@ def test_rejects_local_installation_without_absolute_path(case):
     save_profile()
     with pytest.raises(module.ProfileError, match=r'PinMAME 3\.6.*provenance.*installation_path'):
         module.inspect_fixtures(*case[:2])
+
+
+
+def test_authoring_scope_reports_runtime_as_unverified(case):
+    rom, dump, toolchain, _, _ = case
+    locked = module.lock_profile(rom, dump, toolchain, 'authoring')
+    assert locked.authoring_binaries_verified
+    assert not locked.local_runtime_verified
+    assert not locked.native_binaries_verified
 
 
 def test_rejects_x86_bass_even_when_its_sha_is_updated(case):
@@ -309,6 +318,18 @@ def test_authoring_scope_rejects_missing_bundled_decoder(case):
     (toolchain / profile['components']['bundled decoder']['binary']).unlink()
     with pytest.raises(module.ProfileError, match='bundled decoder.*missing'):
         module.lock_profile(rom, dump, toolchain, 'authoring')
+
+
+@pytest.mark.skipif(os.environ.get('DMD_LOCAL_RUNTIME') != '1', reason='requires staged local runtime')
+def test_local_runtime_rejects_staged_serum_corruption(tmp_path):
+    source = ROOT / 'artifacts' / '2026-11-18-task-1-fix-3' / 'toolchain'
+    staged = tmp_path / 'toolchain'
+    import shutil
+    shutil.copytree(source, staged)
+    serum = staged / 'pinmame' / 'serum64.dll'
+    serum.write_bytes(serum.read_bytes() + b'corrupt')
+    with pytest.raises(module.ProfileError, match='local Serum runtime.*SHA-256'):
+        module.lock_profile(ROOT / 'twst_405.zip', ROOT / 'twst_405.txt', staged, 'local-runtime')
 
 
 @pytest.mark.skipif(os.environ.get('DMD_LOCAL_RUNTIME') != '1', reason='requires local fixtures')
