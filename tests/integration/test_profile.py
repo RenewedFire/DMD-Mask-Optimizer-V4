@@ -234,7 +234,7 @@ def test_names_changed_dependency(case):
     dependency = 'pinmame/Bass64.dll'
     target = toolchain / dependency
     target.write_bytes(b'original')
-    profile['components']['PinMAME 3.6']['dependencies'][dependency] = {'sha256': sha256(target), 'architecture': 'x64', 'binary_version': '9.9.9.9'}
+    profile['components']['PinMAME 3.6']['dependencies'][dependency] = {'sha256': sha256(target), 'architecture': 'x64', 'file_version': '9.9.9.9'}
     save_profile()
     assert module.lock_profile(rom, dump, toolchain).local_runtime_verified
     target.write_bytes(b'changed')
