@@ -13,7 +13,7 @@ from pathlib import Path
 
 PROFILE_PATH = Path(__file__).resolve().parents[1] / "profiles" / "twst_405.json"
 PE_ARCHITECTURES = {0x014C: "x86", 0x8664: "x64", 0xAA64: "arm64"}
-REQUIRED_COMPONENTS = ("ColorizingDMD editor", "bundled decoder", "PinMAME 3.6")
+REQUIRED_COMPONENTS = ("ColorizingDMD editor", "bundled decoder", "PinMAME 3.6", "local Serum runtime")
 
 
 class ProfileError(ValueError):
@@ -42,6 +42,8 @@ class Profile:
     rom_members: tuple[RomMember, ...]
     components: dict[str, dict]
     profile_sha256: str
+    authoring_binaries_verified: bool = False
+    local_runtime_verified: bool = False
     native_binaries_verified: bool = False
 
 
@@ -132,11 +134,15 @@ def _validate_provenance(record, name):
     if not isinstance(provenance, dict):
         raise ProfileError(f"{name}: invalid provenance; expected an object")
     kind = _field(provenance, "kind", _nonempty_string, "a nonempty string", f"{name} provenance")
-    if kind != "local-installation":
-        raise ProfileError(f"{name}: invalid provenance kind {kind!r}; expected 'local-installation'")
-    _field(provenance, "installation_path", _windows_absolute_path,
-           "an absolute Windows path", f"{name} provenance")
-    return True
+    if kind == "local-installation":
+        _field(provenance, "installation_path", _windows_absolute_path,
+               "an absolute Windows path", f"{name} provenance")
+        return True
+    if kind == "source-tree":
+        _field(provenance, "source_tree_binary_git_blob", lambda value: _hex(value, 40),
+               "a full lowercase Git blob ID", f"{name} provenance")
+        return False
+    raise ProfileError(f"{name}: invalid provenance kind {kind!r}; expected 'local-installation' or 'source-tree'")
 
 
 def _validate_component(name, record):
@@ -146,6 +152,10 @@ def _validate_component(name, record):
     _field(record, "sha256", lambda value: _hex(value, 64), "a lowercase SHA-256 digest", name)
     _field(record, "architecture", lambda value: isinstance(value, str) and value in PE_ARCHITECTURES.values(),
            "x86, x64 or arm64", name)
+    _field(record, "verification_scope", lambda value: value in {"authoring", "local-runtime"},
+           "'authoring' or 'local-runtime'", name)
+    if "binary_version" in record:
+        _field(record, "binary_version", _nonempty_string, "a nonempty string", name)
     _field(record, "source_commit", lambda value: _hex(value, 40), "a full lowercase Git commit ID", name)
     for field in ("source_repository", "release_tag", "release_url", "release_archive"):
         _field(record, field, _nonempty_string, "a nonempty string", name)
@@ -164,18 +174,25 @@ def _validate_component(name, record):
     dependencies = _field(record, "dependencies", lambda value: isinstance(value, dict), "an object", name)
     if name in {"ColorizingDMD editor", "PinMAME 3.6"} and not dependencies:
         raise ProfileError(f"{name}: missing dependencies; expected a nonempty runtime dependency lock")
-    for path, digest in dependencies.items():
+    for path, lock in dependencies.items():
         if not _toolchain_path(path):
             raise ProfileError(f"{name}: invalid dependencies path {path!r}; expected a relative toolchain path")
+        digest = lock if isinstance(lock, str) else lock.get("sha256") if isinstance(lock, dict) else None
         if not _hex(digest, 64):
             raise ProfileError(f"{name}: invalid dependencies hash for {path}; expected a lowercase SHA-256 digest")
+        if isinstance(lock, dict):
+            _field(lock, "architecture", lambda value: value in PE_ARCHITECTURES.values(),
+                   "x86, x64 or arm64", f"{name} dependency {path}")
+            _field(lock, "binary_version", _nonempty_string, "a nonempty string",
+                   f"{name} dependency {path}")
 
 
 def _validate_profile(record):
     name = "profile"
     if not isinstance(record, dict):
         raise ProfileError("profile: expected an object")
-    _field(record, "schema_version", lambda value: type(value) is int and value == 1, "version 1", name)
+    _field(record, "schema_version", lambda value: type(value) is int and value == 2, "version 2", name)
+    _field(record, "lock_scopes", lambda value: isinstance(value, dict), "an object", name)
     for field in ("rom_revision", "driver", "hardware"):
         _field(record, field, _nonempty_string, "a nonempty string", name)
     for field in ("width", "height", "native_shades"):
@@ -273,32 +290,59 @@ def _architecture(path, name):
     raise ProfileError(f"{name}: invalid Windows PE header in {path}")
 
 
-def _verify_component(name, component, toolchain):
-    path = toolchain / component["binary"]
-    _check_sha256(path, component["sha256"], name)
+def _file_version(path, name):
+    """Read the Windows VERSIONINFO FileVersion without third-party packages."""
+    if sys.platform != "win32":
+        raise ProfileError(f"{name}: Windows file-version verification requires Windows")
+    import ctypes
+    size = ctypes.windll.version.GetFileVersionInfoSizeW(str(path), None)
+    if not size:
+        raise ProfileError(f"{name}: missing Windows VERSIONINFO in {path}")
+    data = ctypes.create_string_buffer(size)
+    if not ctypes.windll.version.GetFileVersionInfoW(str(path), 0, size, data):
+        raise ProfileError(f"{name}: cannot read Windows VERSIONINFO from {path}")
+    value, length = ctypes.c_void_p(), ctypes.c_uint()
+    if not ctypes.windll.version.VerQueryValueW(data, "\\\\", ctypes.byref(value), ctypes.byref(length)):
+        raise ProfileError(f"{name}: invalid Windows VERSIONINFO in {path}")
+    info = ctypes.cast(value, ctypes.POINTER(ctypes.c_ushort * 26)).contents
+    return ".".join(str(part) for part in (info[4], info[5], info[6], info[7]))
+
+
+def _verify_binary(path, lock, name):
+    _check_sha256(path, lock["sha256"], name)
     architecture = _architecture(path, name)
-    expected = component["architecture"]
-    if architecture != expected:
-        raise ProfileError(f"{name}: architecture mismatch for {path}; expected {expected}, got {architecture}")
-    for relative_path, sha256 in component["dependencies"].items():
-        _check_sha256(toolchain / relative_path, sha256, f"{name} dependency {relative_path}")
+    if architecture != lock["architecture"]:
+        raise ProfileError(f"{name}: architecture mismatch for {path}; expected {lock['architecture']}, got {architecture}")
+    if "binary_version" in lock:
+        version = _file_version(path, name)
+        if version != lock["binary_version"]:
+            raise ProfileError(f"{name}: file-version mismatch for {path}; expected {lock['binary_version']}, got {version}")
+
+
+def _verify_component(name, component, toolchain):
+    _verify_binary(toolchain / component["binary"], component, name)
+    for relative_path, lock in component["dependencies"].items():
+        dependency = lock if isinstance(lock, dict) else {"sha256": lock}
+        _verify_binary(toolchain / relative_path, dependency, f"{name} dependency {relative_path}")
     if component["pending"]:
         raise ProfileError(f"{name}: missing provenance: {', '.join(component['pending'])}")
 
 
 def lock_profile(rom: Path, dump: Path, toolchain: Path) -> Profile:
-    """Require the exact Twister fixture and pinned native binaries under toolchain."""
+    """Lock local runtime independently from the original editor/decoder authoring lock."""
     profile = inspect_fixtures(rom, dump)
-    errors = []
+    scope_errors = {"authoring": [], "local-runtime": []}
     for name, component in profile.components.items():
         try:
             _verify_component(name, component, toolchain)
         except ProfileError as exc:
-            errors.append(str(exc))
-    if errors:
-        raise ProfileError("\n".join(errors))
-    return replace(profile, native_binaries_verified=True)
-
+            scope_errors[component["verification_scope"]].append(str(exc))
+    if scope_errors["local-runtime"]:
+        raise ProfileError("\n".join(scope_errors["local-runtime"]))
+    authoring_verified = not scope_errors["authoring"]
+    return replace(profile, authoring_binaries_verified=authoring_verified,
+                   local_runtime_verified=True,
+                   native_binaries_verified=authoring_verified)
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
