@@ -217,8 +217,9 @@ def test_names_changed_binary(case, name):
     rom, dump, toolchain, profile, _ = case
     target = toolchain / profile['components'][name]['binary']
     target.write_bytes(target.read_bytes() + b'changed')
+    scope = 'authoring' if profile['components'][name]['verification_scope'] == 'authoring' else 'local-runtime'
     with pytest.raises(module.ProfileError, match=rf'{name}.*SHA-256'):
-        module.lock_profile(rom, dump, toolchain)
+        module.lock_profile(rom, dump, toolchain, scope)
 
 
 def test_names_missing_binary(case):
@@ -249,7 +250,7 @@ def test_rejects_wrong_binary_architecture_even_when_hashed(case):
     record['sha256'] = sha256(target)
     save_profile()
     with pytest.raises(module.ProfileError, match='bundled decoder.*architecture.*x64.*x86'):
-        module.lock_profile(rom, dump, toolchain)
+        module.lock_profile(rom, dump, toolchain, 'authoring')
 
 
 def test_names_pending_native_provenance(case):
@@ -257,7 +258,7 @@ def test_names_pending_native_provenance(case):
     profile['components']['bundled decoder']['pending'] = ['verified build provenance']
     save_profile()
     with pytest.raises(module.ProfileError, match='bundled decoder.*verified build provenance'):
-        module.lock_profile(*case[:3])
+        module.lock_profile(*case[:3], scope='authoring')
 
 
 def test_accepts_explicit_local_installation_provenance(case):
