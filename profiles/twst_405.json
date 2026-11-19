@@ -106,7 +106,6 @@
       "binary": "editor/serum64.dll",
       "sha256": "da71fa73e838ab3e257a2a73c8f74d88a3336615930761fa494a251822e0c2d5",
       "architecture": "x64",
-      "binary_version": "2.1.0",
       "compiler": "locally installed vendor binary; build toolchain unavailable",
       "build_command": "not available from local installation",
       "compiler_flags": [
@@ -118,7 +117,13 @@
         "kind": "source-tree",
         "source_tree_binary_git_blob": "311bdb7b1d552d9ef0a2db11a11161df761b1dc4"
       },
-      "verification_scope": "authoring"
+      "verification_scope": "authoring",
+      "file_version": "2.1.0.0",
+      "source_tree_lock": {
+        "git_blob": "311bdb7b1d552d9ef0a2db11a11161df761b1dc4",
+        "sha256": "da71fa73e838ab3e257a2a73c8f74d88a3336615930761fa494a251822e0c2d5",
+        "source_version": "2.1.0"
+      }
     },
     "PinMAME 3.6": {
       "source_repository": "https://github.com/vpinball/pinmame",
@@ -131,7 +136,6 @@
       "binary": "pinmame/VPinMAME64.dll",
       "sha256": "69ebacabdb7e1af0533142a8456341f06e9d4b6cb3dc4649f18794be456ea8c1",
       "architecture": "x64",
-      "binary_version": "3.6.0.1227.ecd032e",
       "compiler": "GitHub Actions windows-2019, Visual Studio 2019 generator with MSVC v141_xp; PE linker 14.16",
       "build_command": "Copy-Item cmake/vpinmame/CMakeLists_win-x64.txt CMakeLists.txt\ncmake -T v141_xp -G 'Visual Studio 16 2019' -A x64 -B build/vpinmame\ncmake --build build/vpinmame --config Release",
       "compiler_flags": [
@@ -154,7 +158,7 @@
         "pinmame/Bass64.dll": {
           "sha256": "94ff6f6d935292b6664779b06ddd6a63db274c962dc15e18723f9a46c5529d4f",
           "architecture": "x64",
-          "binary_version": "2.4.17.0"
+          "file_version": "2.4.17.0"
         }
       },
       "pending": [],
@@ -162,7 +166,9 @@
         "kind": "local-installation",
         "installation_path": "C:\\vPinball\\VisualPinball\\VPinMAME"
       },
-      "verification_scope": "local-runtime"
+      "verification_scope": "local-runtime",
+      "file_version": "3.6.0.1227",
+      "build_identity": "ecd032e"
     },
     "local Serum runtime": {
       "source_repository": "https://github.com/SerumColor/ColorizingDMD",
@@ -174,7 +180,6 @@
       "binary": "pinmame/serum64.dll",
       "sha256": "37df5ee09c4dc9373524a48685c844f19af624e8cfcde67900456bcc6ba18221",
       "architecture": "x64",
-      "binary_version": "2.5.2",
       "verification_scope": "local-runtime",
       "compiler": "locally installed vendor binary; build toolchain unavailable",
       "build_command": "not available from local installation",
@@ -187,7 +192,9 @@
         "kind": "local-installation",
         "installation_path": "C:\\vPinball\\VisualPinball\\VPinMAME"
       },
-      "compatibility_with_authoring_decoder": "unverified"
+      "compatibility_with_authoring_decoder": "unverified",
+      "file_version": "2.5.2.0",
+      "product_identity": "2.5.2"
     }
   },
   "lock_scopes": {
