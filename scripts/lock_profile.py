@@ -154,8 +154,9 @@ def _validate_component(name, record):
            "x86, x64 or arm64", name)
     _field(record, "verification_scope", lambda value: value in {"authoring", "local-runtime"},
            "'authoring' or 'local-runtime'", name)
-    if "binary_version" in record:
-        _field(record, "binary_version", _nonempty_string, "a nonempty string", name)
+    if "file_version" in record:
+        _field(record, "file_version", lambda value: isinstance(value, str) and re.fullmatch(r"\d+\.\d+\.\d+\.\d+", value) is not None,
+               "a numeric a.b.c.d file version", name)
     _field(record, "source_commit", lambda value: _hex(value, 40), "a full lowercase Git commit ID", name)
     for field in ("source_repository", "release_tag", "release_url", "release_archive"):
         _field(record, field, _nonempty_string, "a nonempty string", name)
@@ -183,8 +184,8 @@ def _validate_component(name, record):
         if isinstance(lock, dict):
             _field(lock, "architecture", lambda value: value in PE_ARCHITECTURES.values(),
                    "x86, x64 or arm64", f"{name} dependency {path}")
-            _field(lock, "binary_version", _nonempty_string, "a nonempty string",
-                   f"{name} dependency {path}")
+            _field(lock, "file_version", lambda value: isinstance(value, str) and re.fullmatch(r"\d+\.\d+\.\d+\.\d+", value) is not None,
+                   "a numeric a.b.c.d file version", f"{name} dependency {path}")
 
 
 def _validate_profile(record):
@@ -218,9 +219,9 @@ def _validate_profile(record):
         if decoder[field] != editor[field]:
             raise ProfileError(f"{name}: {field} differs from ColorizingDMD editor")
     source_version = _field(decoder, "source_version", _nonempty_string, "a nonempty string", name)
-    binary_version = _field(decoder, "binary_version", _nonempty_string, "a nonempty string", name)
-    if source_version != binary_version and not decoder["pending"] and not _local_installation(decoder):
-        raise ProfileError(f"{name}: binary_version {binary_version} differs from source_version {source_version}")
+    source_tree_version = _field(decoder, "source_tree_binary_version", _nonempty_string, "a nonempty string", name)
+    if decoder.get("provenance", {}).get("kind") == "source-tree" and source_version != source_tree_version:
+        raise ProfileError(f"{name}: source_version {source_version} differs from source_tree_binary_version {source_tree_version}")
 
 
 def _manifest_members(records):
@@ -314,10 +315,10 @@ def _verify_binary(path, lock, name):
     architecture = _architecture(path, name)
     if architecture != lock["architecture"]:
         raise ProfileError(f"{name}: architecture mismatch for {path}; expected {lock['architecture']}, got {architecture}")
-    if "binary_version" in lock:
+    if "file_version" in lock:
         version = _file_version(path, name)
-        if version != lock["binary_version"]:
-            raise ProfileError(f"{name}: file-version mismatch for {path}; expected {lock['binary_version']}, got {version}")
+        if version != lock["file_version"]:
+            raise ProfileError(f"{name}: file-version mismatch for {path}; expected {lock['file_version']}, got {version}")
 
 
 def _verify_component(name, component, toolchain):
@@ -342,10 +343,13 @@ def lock_profile(rom: Path, dump: Path, toolchain: Path, scope="local-runtime") 
             scope_errors[component["verification_scope"]].append(str(exc))
     if scope_errors[scope]:
         raise ProfileError("\n".join(scope_errors[scope]))
-    authoring_verified = not scope_errors["authoring"]
+    # The unselected scope is deliberately *unverified*, even if its files happen
+    # to be present: callers must make a separate explicit assertion.
+    authoring_verified = scope == "authoring"
+    local_runtime_verified = scope == "local-runtime"
     return replace(profile, authoring_binaries_verified=authoring_verified,
-                   local_runtime_verified=True,
-                   native_binaries_verified=authoring_verified)
+                   local_runtime_verified=local_runtime_verified,
+                   native_binaries_verified=False)
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
