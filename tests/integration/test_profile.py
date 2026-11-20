@@ -53,6 +53,12 @@ def case(tmp_path, monkeypatch):
                       release_archive_sha256='f' * 64,
                       verification_scope='authoring' if name in {'ColorizingDMD editor', 'bundled decoder'} else 'local-runtime')
     decoder = profile['components']['bundled decoder']
+    texture = toolchain / 'editor/textures/chiffres.raw'
+    texture.parent.mkdir()
+    texture.write_bytes(b'synthetic texture')
+    profile['components']['ColorizingDMD editor']['startup_assets']['textures/chiffres.raw'] = {
+        'sha256': sha256(texture), 'size': texture.stat().st_size,
+    }
     decoder['file_version'] = '2.1.0.0'
     for name, dependency in [('ColorizingDMD editor', 'editor/LiteZip.dll'), ('PinMAME 3.6', 'pinmame/Bass64.dll')]:
         target = toolchain / dependency

@@ -5,6 +5,7 @@ import os
 import shutil
 import struct
 import subprocess
+import tempfile
 from dataclasses import replace
 from pathlib import Path
 
@@ -22,6 +23,8 @@ from scripts.lock_profile import Profile, RomMember, _read_profile
 
 
 PINNED_DECODER = "da71fa73e838ab3e257a2a73c8f74d88a3336615930761fa494a251822e0c2d5"
+TEXTURE = "textures/chiffres.raw"
+TEXTURE_LOCK = {"size": 1815, "sha256": "9eeea44b769035c9e49fe2fe90afa1463e047073384da0411c1c7e8e9a3f9a97"}
 
 
 @pytest.fixture(scope="module")
@@ -77,7 +80,12 @@ BOOL WINAPI probe_write(HANDLE file, LPCVOID buffer, DWORD size, LPDWORD count, 
 #include "editor_bridge.cpp"
 #undef main
 int wmain(int argc, wchar_t** argv) {
-    if (argc == 1) return editor_bridge_main();
+    if (argc == 1) return editor_bridge_main(1, nullptr);
+    if (argc == 2 && std::wstring_view(argv[1]) == L"--startup-preflight") {
+        char flag[] = "--startup-preflight";
+        char* args[]{nullptr, flag};
+        return editor_bridge_main(2, args);
+    }
     if (argc != 3 || std::wstring_view(argv[1]) != L"--interrupt-marker") return 2;
     init_apartment(apartment_type::multi_threaded);
     fs::path root(argv[2]);
@@ -145,8 +153,8 @@ extern "C" __declspec(dllexport) const char* probe(
     script = build / "compile.cmd"
     script.write_text(
         f'@call "{vcvars}" && cl /nologo /std:c++20 /EHsc /utf-8 /LD '
-        f'/I"{native}" probe.cpp windowsapp.lib advapi32.lib /link /out:probe.dll '
-        '&& link /nologo probe.obj windowsapp.lib advapi32.lib /subsystem:console /out:preflight.exe\n'
+        f'/I"{native}" probe.cpp windowsapp.lib advapi32.lib user32.lib /link /out:probe.dll '
+        '&& link /nologo probe.obj windowsapp.lib advapi32.lib user32.lib /subsystem:console /out:preflight.exe\n'
     )
     compiled = subprocess.run(["cmd", "/d", "/c", script.name], cwd=build,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -724,13 +732,15 @@ def test_stages_only_profile_files_and_exact_source_tree_decoder(
     staged = stage_editor(source, tmp_path / "stage", profile, decoder_path=decoder)
 
     editor = profile.components["ColorizingDMD editor"]
-    assert set(path.name for path in staged.iterdir()) == {
+    assert {path.relative_to(staged).as_posix() for path in staged.rglob("*") if path.is_file()} == {
         "ColorizingDMD.exe",
         "serum64.dll",
+        TEXTURE,
         *(Path(path).name for path in editor["dependencies"]),
     }
     assert hashlib.sha256((staged / "serum64.dll").read_bytes()).hexdigest() == PINNED_DECODER
     assert (staged / "serum64.dll").read_bytes() == decoder.read_bytes()
+    assert hashlib.sha256((staged / TEXTURE).read_bytes()).hexdigest() == TEXTURE_LOCK["sha256"]
 
 
 def test_rejects_installed_adjacent_decoder_before_launch(
@@ -752,7 +762,7 @@ def test_stage_rejects_decoder_substitution(installed_artifacts, profile, tmp_pa
     source, _ = installed_artifacts
     staged = tmp_path / "stage"
 
-    with pytest.raises(EditorBridgeError, match="bundled decoder.*SHA-256 mismatch"):
+    with pytest.raises(EditorBridgeError, match="bundled decoder.*(SHA-256 mismatch|separate source-tree)"):
         stage_editor(source, staged, profile, decoder_path=source / "serum64.dll")
 
     assert not staged.exists()
@@ -862,22 +872,83 @@ def test_adapter_retains_recovery_evidence_on_unverified_manifest(requested_proj
     assert failure.value.diagnostics == diagnostics
 
 
-def test_native_preflight_reports_missing_startup_texture(
-    installed_artifacts, case, profile, tmp_path, registry_probe, monkeypatch,
+@pytest.mark.parametrize("corrupt", [False, True], ids=["missing", "changed"])
+def test_native_rejects_damaged_texture_before_registry_preparation(
+    installed_artifacts, case, profile, tmp_path, registry_probe, corrupt,
 ):
-    monkeypatch.setenv("DMD_EDITOR_BRIDGE_PATH", str(registry_probe.executable))
     source, decoder = installed_artifacts
     stage = stage_editor(source, tmp_path / "stage", profile, decoder_path=decoder)
-    with pytest.raises(EditorBridgeError, match=r"textures[/\\]chiffres\.raw"):
-        write_project(tmp_path / "project", case, profile, editor_root=stage)
-    response = json.loads((tmp_path / "project-editor-config" / "bridge.stdout").read_bytes())
+    request = serialize_request(tmp_path / "project", case, profile, editor_root=stage)
+    if corrupt:
+        (stage / TEXTURE).parent.mkdir(exist_ok=True)
+        (stage / TEXTURE).write_bytes(bytes(TEXTURE_LOCK["size"]))
+    else:
+        (stage / TEXTURE).unlink(missing_ok=True)
+    with pytest.raises(EditorBridgeError, match=r"chiffres\.raw"):
+        serialize_request(tmp_path / "project", case, profile, editor_root=stage)
+    result = subprocess.run([registry_probe.executable, "--startup-preflight"],
+                            input=request.encode(), capture_output=True)
+    response = json.loads(result.stdout)
     assert response["status"] == "error"
     assert response["stage"] == "startup-assets"
+    assert "registry_transaction" not in response["diagnostics"]
+    assert b"private probe denied HKCU open" not in result.stderr
     assert response["diagnostics"]["editor_launched"] is False
     journal = Path(response["diagnostics"]["registry_recovery"]["marker_path"]).parent.parent
     assert journal == registry_probe.executable.parent / "artifacts" / "editor-isolation-journal"
     assert response["diagnostics"]["decoder_sha256"] == PINNED_DECODER
     assert not (tmp_path / "project").exists()
+
+
+def test_profile_declares_required_startup_texture(locked_profile):
+    editor = locked_profile.components["ColorizingDMD editor"]
+    assert editor.get("startup_assets", {}).get(TEXTURE) == TEXTURE_LOCK
+    assert Path(editor["startup_asset_source"]) == Path(r"C:\DMD Colorization\ColorizingDMD")
+
+
+def test_valid_stage_requires_explicit_startup_before_registry_access(
+    installed_artifacts, case, profile, tmp_path, registry_probe, monkeypatch,
+):
+    source, decoder = installed_artifacts
+    stage = stage_editor(source, tmp_path / "stage", profile, decoder_path=decoder)
+    monkeypatch.setenv("DMD_EDITOR_BRIDGE_PATH", str(registry_probe.executable))
+    with pytest.raises(EditorBridgeError) as failure:
+        write_project(tmp_path / "project", case, profile, editor_root=stage)
+    response = json.loads((tmp_path / "project-editor-config" / "bridge.stdout").read_bytes())
+    assert response["stage"] == "startup-opt-in"
+    assert failure.value.diagnostics["startup_assets"][TEXTURE] == TEXTURE_LOCK
+    assert "registry_transaction" not in failure.value.diagnostics
+    # The exact native inventory must admit the valid stage. The private
+    # executable denies the following HKCU open before starting a transaction.
+    with pytest.raises(EditorBridgeError, match="open current user SOFTWARE") as failure:
+        write_project(tmp_path / "valid", case, profile, editor_root=stage, startup_preflight=True)
+    assert failure.value.diagnostics["editor_launched"] is False
+    (stage / "extra.dll").write_bytes(b"undeclared")
+    config = tmp_path / "other-editor-config"
+    with pytest.raises(EditorBridgeError, match="inventory") as failure:
+        write_project(tmp_path / "other", case, profile, editor_root=stage, startup_preflight=True)
+    assert failure.value.diagnostics["editor_launched"] is False
+    assert "registry_transaction" not in failure.value.diagnostics
+    assert b"private probe denied HKCU open" not in (config / "bridge.stderr").read_bytes()
+
+
+@pytest.mark.skipif(os.environ.get("DMD_EDITOR_STARTUP_PREFLIGHT") != "1",
+                    reason="explicit real-editor startup preflight")
+def test_real_startup_preflight(installed_artifacts, locked_profile, case):
+    source, decoder = installed_artifacts
+    artifacts = Path(__file__).resolve().parents[2] / "artifacts"
+    artifacts.mkdir(exist_ok=True)
+    run = Path(tempfile.mkdtemp(prefix="startup-preflight-", dir=artifacts))
+    stage = stage_editor(source, run / "editor", locked_profile, decoder_path=decoder)
+    with pytest.raises(EditorBridgeError) as failure:
+        write_project(run / "project", case, locked_profile, editor_root=stage, deadline_ms=25000,
+                      startup_preflight=True)
+    diagnostics = failure.value.diagnostics
+    assert diagnostics.get("startup_assets", {}).get(TEXTURE) == TEXTURE_LOCK, (run, str(failure.value))
+    transaction = diagnostics["registry_transaction"]
+    assert transaction["verified"] and not Path(transaction["marker_path"]).exists()
+    assert diagnostics["editor_launched"] and diagnostics["editor_exited"], (run, diagnostics)
+    assert diagnostics["decoder_sha256"] == PINNED_DECODER
 
 
 @pytest.mark.skipif(os.environ.get("DMD_EDITOR_ROUNDTRIP") != "1",

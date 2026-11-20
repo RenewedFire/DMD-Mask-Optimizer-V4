@@ -149,6 +149,15 @@ def _validate_component(name, record):
     if not isinstance(record, dict):
         raise ProfileError(f"{name}: invalid component record; expected an object")
     _field(record, "binary", _toolchain_path, "a relative toolchain path", name)
+    if name == "ColorizingDMD editor":
+        _field(record, "startup_asset_source", _windows_absolute_path, "an absolute Windows path", name)
+        assets = _field(record, "startup_assets", lambda value: isinstance(value, dict)
+                        and "textures/chiffres.raw" in value, "the required editor startup asset locks", name)
+        for path, lock in assets.items():
+            if not _toolchain_path(path) or not isinstance(lock, dict):
+                raise ProfileError(f"{name}: invalid startup asset {path!r}")
+            _field(lock, "sha256", lambda value: _hex(value, 64), "a lowercase SHA-256 digest", path)
+            _field(lock, "size", lambda value: type(value) is int and value >= 0, "a byte count", path)
     _field(record, "sha256", lambda value: _hex(value, 64), "a lowercase SHA-256 digest", name)
     _field(record, "architecture", lambda value: isinstance(value, str) and value in PE_ARCHITECTURES.values(),
            "x86, x64 or arm64", name)
@@ -327,8 +336,16 @@ def _verify_component(name, component, toolchain):
     for relative_path, lock in component["dependencies"].items():
         dependency = lock if isinstance(lock, dict) else {"sha256": lock}
         _verify_binary(toolchain / relative_path, dependency, f"{name} dependency {relative_path}")
+    for relative, lock in component.get("startup_assets", {}).items():
+        _verify_asset((toolchain / component["binary"]).parent / relative, lock, relative)
     if component["pending"]:
         raise ProfileError(f"{name}: missing provenance: {', '.join(component['pending'])}")
+
+
+def _verify_asset(path, lock, name):
+    _check_sha256(path, lock["sha256"], name)
+    if path.stat().st_size != lock["size"]:
+        raise ProfileError(f"{name}: size mismatch for {path}; expected {lock['size']} bytes")
 
 
 def lock_profile(rom: Path, dump: Path, toolchain: Path, scope="local-runtime") -> Profile:

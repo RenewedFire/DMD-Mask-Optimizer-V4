@@ -19,6 +19,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -474,7 +475,101 @@ int failure(hstring const& stage, hstring const& message, JsonObject const& diag
     return 1;
 }
 
-int preflight(JsonObject const& request, JsonObject const& diagnostics) {
+// Canonical inventory of the authoring files in twst_405.json: sorted lowercase
+// editor-relative paths, one UTF-8 "path sha256\n" line per file.
+void verify_launch_inventory(fs::path const& editor) {
+    std::map<std::string, std::string> files;
+    for (auto const& entry : fs::recursive_directory_iterator(editor)) {
+        if (!artifact_exists(entry.path())) throw std::runtime_error("staged file disappeared");
+        if (entry.is_directory()) continue;
+        auto name = entry.path().lexically_relative(editor).generic_string();
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+            return char(c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c);
+        });
+        if (!files.emplace(name, to_string(file_hash(entry.path()))).second)
+            throw std::runtime_error("duplicate staged editor file");
+    }
+    std::string inventory;
+    for (auto const& [name, digest] : files) inventory += name + " " + digest + "\n";
+    auto data = reinterpret_cast<uint8_t const*>(inventory.data());
+    auto buffer = CryptographicBuffer::CreateFromByteArray({data, data + inventory.size()});
+    auto digest = HashAlgorithmProvider::OpenAlgorithm(L"SHA256").HashData(buffer);
+    if (CryptographicBuffer::EncodeToHexString(digest) !=
+        L"855eb895f1c3e484bfa31b50f75a6bc0ed1c1806eba4d3c19d445ebb0c35d99f")
+        throw std::runtime_error("staged editor inventory differs from the locked authoring files");
+}
+
+struct WindowObservation {
+    DWORD pid;
+    std::vector<std::wstring> titles;
+};
+
+BOOL CALLBACK observe_window(HWND window, LPARAM context) {
+    auto& observation = *reinterpret_cast<WindowObservation*>(context);
+    DWORD pid{};
+    GetWindowThreadProcessId(window, &pid);
+    if (pid == observation.pid && IsWindowVisible(window)) {
+        wchar_t title[256]{};
+        if (GetWindowTextW(window, title, 256)) observation.titles.emplace_back(title);
+    }
+    return TRUE;
+}
+
+void bounded_startup(fs::path const& editor, DWORD duration, JsonObject const& diagnostics) {
+    handle job(CreateJobObjectW(nullptr, nullptr));
+    check_bool(bool(job));
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    check_bool(SetInformationJobObject(job.get(), JobObjectExtendedLimitInformation, &limits, sizeof(limits)));
+    // Assign at creation so interruption cannot leave an unowned editor.
+    SIZE_T size{};
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &size);
+    std::vector<BYTE> storage(size);
+    auto attributes = reinterpret_cast<PPROC_THREAD_ATTRIBUTE_LIST>(storage.data());
+    check_bool(InitializeProcThreadAttributeList(attributes, 1, 0, &size));
+    struct AttributeCleanup {
+        PPROC_THREAD_ATTRIBUTE_LIST list;
+        ~AttributeCleanup() { DeleteProcThreadAttributeList(list); }
+    } cleanup{attributes};
+    HANDLE jobs[]{job.get()};
+    check_bool(UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST,
+        jobs, sizeof(jobs), nullptr, nullptr));
+    STARTUPINFOEXW startup{};
+    startup.StartupInfo.cb = sizeof(startup);
+    startup.lpAttributeList = attributes;
+    PROCESS_INFORMATION child{};
+    check_bool(CreateProcessW((editor / L"ColorizingDMD.exe").c_str(), nullptr, nullptr, nullptr, FALSE,
+        EXTENDED_STARTUPINFO_PRESENT, nullptr, editor.c_str(), &startup.StartupInfo, &child));
+    handle process(child.hProcess), thread(child.hThread);
+    // Finish termination before the registry transaction can restore its snapshot,
+    // including when gathering observations throws.
+    struct StopEditor {
+        handle& job;
+        HANDLE process;
+        ~StopEditor() { job.close(); WaitForSingleObject(process, INFINITE); }
+    };
+    {
+        StopEditor stop{job, process.get()};
+        diagnostics.SetNamedValue(L"editor_launched", JsonValue::CreateBooleanValue(true));
+        diagnostics.Insert(L"editor_pid", JsonValue::CreateNumberValue(child.dwProcessId));
+        diagnostics.Insert(L"observation_ms", JsonValue::CreateNumberValue(duration));
+        DWORD wait = WaitForSingleObject(process.get(), duration);
+        if (wait != WAIT_OBJECT_0 && wait != WAIT_TIMEOUT) throw_last_error();
+        diagnostics.Insert(L"running_at_deadline", JsonValue::CreateBooleanValue(wait == WAIT_TIMEOUT));
+        WindowObservation observation{child.dwProcessId, {}};
+        EnumWindows(observe_window, reinterpret_cast<LPARAM>(&observation));
+        JsonArray titles;
+        for (auto const& title : observation.titles) titles.Append(JsonValue::CreateStringValue(title));
+        diagnostics.Insert(L"visible_window_titles", titles);
+    }
+    DWORD exit_code{};
+    check_bool(GetExitCodeProcess(process.get(), &exit_code));
+    diagnostics.Insert(L"editor_exit_code", JsonValue::CreateNumberValue(exit_code));
+    diagnostics.Insert(L"editor_exited", JsonValue::CreateBooleanValue(true));
+}
+
+int preflight(JsonObject const& request, JsonObject const& diagnostics, bool launch,
+              fs::path const& journal, std::function<HKEY()> const& software, hstring& stage) {
     if (request.GetNamedNumber(L"schema_version") != 1 ||
         request.GetNamedString(L"expected_decoder_sha256") != decoder_hash)
         throw std::runtime_error("unsupported request version or decoder lock");
@@ -486,25 +581,57 @@ int preflight(JsonObject const& request, JsonObject const& diagnostics) {
     auto editor = request_path(request, L"editor_root");
     auto project = request_path(request, L"project_root");
     auto config = request_path(request, L"config_root");
-    std::array<fs::path, 4> roots{editor, project, config, LR"(C:\vPinball\ColorizingDMD)"};
+    std::array<fs::path, 5> roots{editor, project, config, LR"(C:\vPinball\ColorizingDMD)",
+        LR"(C:\DMD Colorization\ColorizingDMD)"};
     for (size_t i = 0; i < roots.size(); ++i) {
         for (size_t j = i + 1; j < roots.size(); ++j) {
             if (overlaps(roots[i], roots[j]) || overlaps(roots[j], roots[i]))
                 throw std::runtime_error("editor, installation and output roots must be disjoint");
         }
     }
-    if (file_hash(editor / L"ColorizingDMD.exe") != editor_hash)
+    auto exe = file_hash(editor / L"ColorizingDMD.exe");
+    diagnostics.Insert(L"editor_sha256", JsonValue::CreateStringValue(exe));
+    if (exe != editor_hash)
         return failure(L"editor-lock", L"Staged ColorizingDMD.exe SHA-256 mismatch", diagnostics);
     auto decoder = file_hash(editor / L"serum64.dll");
     diagnostics.Insert(L"decoder_sha256", JsonValue::CreateStringValue(decoder));
     if (decoder != decoder_hash)
         return failure(L"decoder-lock", L"Staged source-tree Serum 2.1.0 SHA-256 mismatch", diagnostics);
 
-    // CreateTextures() returns false when it cannot read this file; wWinMain
-    // then exits before loading Serum or entering the message loop.
-    if (!fs::is_regular_file(editor / L"textures" / L"chiffres.raw"))
-        return failure(L"startup-assets", L"The staged file set lacks textures/chiffres.raw, required by CreateTextures()", diagnostics);
-    return failure(L"config-isolation", L"The editor reads and writes HKCU\\SOFTWARE\\ColorizingDMD. An isolated profile is required before launch.", diagnostics);
+    stage = L"startup-assets";
+    auto texture = editor / L"textures" / L"chiffres.raw";
+    if (!fs::is_regular_file(texture)) return failure(stage, L"Missing textures/chiffres.raw", diagnostics);
+    auto texture_digest = file_hash(texture);
+    auto size = fs::file_size(texture);
+    JsonObject entry, assets;
+    entry.Insert(L"sha256", JsonValue::CreateStringValue(texture_digest));
+    entry.Insert(L"size", JsonValue::CreateNumberValue(static_cast<double>(size)));
+    assets.Insert(L"textures/chiffres.raw", entry);
+    diagnostics.Insert(L"startup_assets", assets);
+    if (size != 1815 || texture_digest != L"9eeea44b769035c9e49fe2fe90afa1463e047073384da0411c1c7e8e9a3f9a97")
+        return failure(stage, L"Staged textures/chiffres.raw lock mismatch", diagnostics);
+    if (!launch) return failure(L"startup-opt-in", L"Explicit startup preflight required", diagnostics);
+    stage = L"stage-verification";
+    verify_launch_inventory(editor);
+    if (!fs::is_directory(config) || !fs::is_empty(config) || !fs::create_directory(project))
+        throw std::runtime_error("startup preflight requires fresh project and configuration directories");
+    // The pinned editor reads these six REG_SZ paths at startup. Its paths
+    // use the ANSI Win32 API and require room for the trailing separator/NUL.
+    auto dir = config.wstring() + L"\\", projects = project.wstring() + L"\\";
+    for (auto const& path : {dir, projects}) {
+        BOOL substituted = FALSE;
+        bool utf8 = GetACP() == CP_UTF8;
+        int bytes = WideCharToMultiByte(CP_ACP, utf8 ? WC_ERR_INVALID_CHARS : WC_NO_BEST_FIT_CHARS,
+            path.c_str(), -1, nullptr, 0, nullptr, utf8 ? nullptr : &substituted);
+        if (bytes <= 0 || bytes > MAX_PATH || substituted)
+            throw std::runtime_error("editor startup paths must be representable by the pinned ANSI editor");
+    }
+    auto duration = static_cast<DWORD>((std::min)(request.GetNamedNumber(L"deadline_ms"), 5000.0));
+    stage = L"registry-transaction";
+    with_journaled_transaction(software(), journal, {{L"DIR_SERUM", projects}, {L"DIR_DUMPS", dir},
+        {L"DIR_IMAGES", dir}, {L"DIR_GIFS", dir}, {L"DIR_VP", dir}, {L"DIR_AIIMG", dir}}, diagnostics,
+        [&] { bounded_startup(editor, duration, diagnostics); });
+    return failure(L"startup-observation", L"Bounded startup ended; see the observed process and windows", diagnostics);
 }
 
 fs::path production_journal() {
@@ -531,7 +658,7 @@ fs::path production_journal() {
 #endif
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
         init_apartment(apartment_type::multi_threaded);
         JsonObject diagnostics;
@@ -541,15 +668,19 @@ int main() {
             Key software;
             auto journal = production_journal();
             auto owner = L"Global\\DMDMaskOptimizer-EditorIsolation-" + journal.filename().wstring();
-            return with_editor_isolation(journal, owner.c_str(), [&] {
+            auto open_software = [&] {
                 HKEY key{};
                 check_registry(RegOpenKeyExW(HKEY_CURRENT_USER, L"SOFTWARE", 0, KEY_READ | KEY_WRITE, &key),
                     "open current user SOFTWARE for editor recovery");
                 software.reset(key);
                 return software.get();
-            }, diagnostics, [&] {
+            };
+            return with_editor_isolation(journal, owner.c_str(), open_software, diagnostics, [&] {
                 stage = L"request";
-                return preflight(JsonObject::Parse(to_hstring(read_request())), diagnostics);
+                bool launch = argc == 2 && std::string_view(argv[1]) == "--startup-preflight";
+                if (argc != 1 && !launch) throw std::runtime_error("unknown editor bridge option");
+                return preflight(JsonObject::Parse(to_hstring(read_request())), diagnostics,
+                    launch, journal, open_software, stage);
             });
         } catch (hresult_error const& error) {
             return failure(stage, error.message(), diagnostics);

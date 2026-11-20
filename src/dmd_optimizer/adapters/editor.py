@@ -10,7 +10,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from scripts.lock_profile import Profile, ProfileError, _toolchain_path, _verify_binary
+from scripts.lock_profile import Profile, ProfileError, _toolchain_path, _verify_asset, _verify_binary
 
 
 _DECODER_SHA256 = "da71fa73e838ab3e257a2a73c8f74d88a3336615930761fa494a251822e0c2d5"
@@ -58,6 +58,8 @@ def _editor_files(profile: Profile):
     # no Windows VERSIONINFO resource. Its exact digest identifies those bytes.
     decoder_lock = {"sha256": _DECODER_SHA256, "architecture": "x64"}
     records.append((decoder["binary"], decoder_lock, _DECODER))
+    for path, lock in editor["startup_assets"].items():
+        records.append(((toolchain_editor / path).as_posix(), lock, f"startup asset {path}"))
 
     files = []
     names = set()
@@ -85,7 +87,10 @@ def _verify_staged_file(path: Path, lock: dict, name: str) -> None:
     try:
         if path.resolve() != path:
             raise EditorBridgeError(f"{name}: staged file is redirected: {path}")
-        _verify_binary(path, lock, name)
+        if "size" in lock:
+            _verify_asset(path, lock, name)
+        else:
+            _verify_binary(path, lock, name)
     except ProfileError as exc:
         raise EditorBridgeError(str(exc)) from exc
     except OSError as exc:
@@ -95,14 +100,15 @@ def _verify_staged_file(path: Path, lock: dict, name: str) -> None:
 def stage_editor(
     source_root: Path, destination: Path, profile: Profile, *, decoder_path: Path | None = None,
 ) -> Path:
-    """Copy the locked editor to a new directory and verify the copied binaries.
+    """Copy the locked binaries and startup assets to a new verified directory.
 
     Supply decoder_path for an installed editor. With a preassembled source tree,
     the adjacent DLL must already match the source-tree Serum lock.
     """
     source = source_root.resolve()
     target = destination.resolve()
-    if _overlaps(source, target) or _overlaps(_installation(profile), target):
+    asset_source = Path(profile.components[_EDITOR]["startup_asset_source"]).resolve()
+    if any(_overlaps(target, protected) for protected in (source, asset_source, _installation(profile))):
         raise EditorBridgeError("staging destination must be outside the editor source and installation")
     if target.exists():
         raise EditorBridgeError(f"staging destination already exists: {target}")
@@ -117,6 +123,14 @@ def stage_editor(
             staging.mkdir()
             for relative, lock, name in files:
                 origin = decoder_path if name == _DECODER and decoder_path is not None else source / relative
+                if name == _DECODER and origin.resolve() in {
+                    protected / relative for protected in (_installation(profile), asset_source)
+                }:
+                    raise EditorBridgeError("bundled decoder must come from the separate source-tree lock")
+                if "size" in lock:
+                    origin = asset_source / relative
+                    if origin.resolve() != origin:
+                        raise EditorBridgeError(f"{name}: source file is redirected: {origin}")
                 copied = staging / relative
                 try:
                     copied.parent.mkdir(parents=True, exist_ok=True)
@@ -191,10 +205,10 @@ def serialize_request(
         if config_root is not None
         else (project.parent / f"{project.name}-editor-config").resolve()
     )
-    installation = _installation(profile)
-    if _overlaps(editor, installation):
+    installations = (_installation(profile), Path(profile.components[_EDITOR]["startup_asset_source"]).resolve())
+    if any(_overlaps(editor, installation) for installation in installations):
         raise EditorBridgeError("staged editor root must be outside the editor installation")
-    if any(_overlaps(output, protected) for output in (project, config) for protected in (editor, installation)):
+    if any(_overlaps(output, protected) for output in (project, config) for protected in (editor, *installations)):
         raise EditorBridgeError("project and config roots must be outside the staged editor and editor installation")
     if _overlaps(project, config):
         raise EditorBridgeError("project and config roots must be separate")
@@ -217,7 +231,7 @@ def serialize_request(
 
 def write_project(
     folder: Path, refs: Sequence[Reference], profile: Profile, *, editor_root: Path | None = None,
-    deadline_ms: int = 60_000,
+    deadline_ms: int = 60_000, startup_preflight: bool = False,
 ) -> ProjectFiles:
     """Run the original-editor preflight and retain its diagnostics in a fresh config root."""
     request = serialize_request(folder, refs, profile, editor_root=editor_root, deadline_ms=deadline_ms)
@@ -231,8 +245,9 @@ def write_project(
         config.mkdir(parents=True, exist_ok=False)
         try:
             result = subprocess.run(
-                [str(bridge)], input=request.encode("utf-8"), capture_output=True,
-                cwd=config, timeout=deadline_ms / 1000, check=False,
+                [str(bridge), *(["--startup-preflight"] if startup_preflight else [])],
+                input=request.encode("utf-8"), capture_output=True, cwd=config,
+                timeout=deadline_ms / 1000 + (15 if startup_preflight else 0), check=False,
             )
         except subprocess.TimeoutExpired as exc:
             (config / "bridge.stdout").write_bytes(exc.stdout or b"")
