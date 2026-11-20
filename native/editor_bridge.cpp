@@ -426,7 +426,12 @@ void with_registry_transaction(HKEY software, fs::path const& run_root, fs::path
         incomplete.Insert(L"run", JsonValue::CreateStringValue(config.filename().native()));
         incomplete.Insert(L"sha256", JsonValue::CreateStringValue(file_hash(snapshot)));
     }
-    write_new_json(marker, incomplete);
+    // A terminated writer can leave a partial file in its own run directory.
+    // Recovery sees the marker only after the complete record has been flushed.
+    auto pending = config / L"registry-incomplete.pending";
+    write_new_json(pending, incomplete);
+    if (!MoveFileExW(pending.c_str(), marker.c_str(), MOVEFILE_WRITE_THROUGH))
+        throw std::system_error(GetLastError(), std::system_category(), "publish registry marker");
 
     std::exception_ptr operation_error;
     try {

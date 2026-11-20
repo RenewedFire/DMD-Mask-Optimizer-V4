@@ -32,6 +32,7 @@ def registry_probe(tmp_path_factory):
     source = build / "probe.cpp"
     source.write_text(f'#define DMD_REPOSITORY_ROOT LR"({build})"\n' + r'''
 #include <windows.h>
+#include <cstdio>
 #include <string_view>
 // Simulate a counted Win32 enumeration result that cannot be reopened
 // through a null-terminated name. All actual registry I/O stays in the app hive.
@@ -54,14 +55,40 @@ LSTATUS WINAPI probe_enum_value(HKEY k, DWORD i, LPWSTR name, LPDWORD length, LP
 #define RegEnumKeyExW probe_enum_key
 #define RegEnumValueW probe_enum_value
 LSTATUS WINAPI private_open(HKEY key, LPCWSTR name, DWORD flags, REGSAM access, PHKEY result) {
-    if (key == HKEY_CURRENT_USER) return ERROR_ACCESS_DENIED;
+    if (key == HKEY_CURRENT_USER) {
+        std::fputs("private probe denied HKCU open\n", stderr);
+        return ERROR_ACCESS_DENIED;
+    }
     return RegOpenKeyExW(key, name, flags, access, result);
 }
 #define RegOpenKeyExW private_open
+bool interrupt_marker_write{};
+BOOL WINAPI probe_write(HANDLE file, LPCVOID buffer, DWORD size, LPDWORD count, LPOVERLAPPED overlap) {
+    if (interrupt_marker_write &&
+        std::string_view(static_cast<const char*>(buffer), size).find("\"snapshot\"") != std::string_view::npos) {
+        if (WriteFile(file, buffer, size / 2, count, overlap) && FlushFileBuffers(file))
+            ExitProcess(77);
+        ExitProcess(78);
+    }
+    return WriteFile(file, buffer, size, count, overlap);
+}
+#define WriteFile probe_write
 #define main editor_bridge_main
 #include "editor_bridge.cpp"
 #undef main
-int main() { return editor_bridge_main(); }
+int wmain(int argc, wchar_t** argv) {
+    if (argc == 1) return editor_bridge_main();
+    if (argc != 3 || std::wstring_view(argv[1]) != L"--interrupt-marker") return 2;
+    init_apartment(apartment_type::multi_threaded);
+    fs::path root(argv[2]);
+    HKEY hive{};
+    check_registry(RegLoadAppKeyW((root / L"fixture.hiv").c_str(), &hive, KEY_ALL_ACCESS,
+        REG_PROCESS_APPKEY, 0), "open private test hive");
+    interrupt_marker_write = true;
+    with_journaled_transaction(hive, root / L"journal", {{L"DIR_SERUM", L"temporary"}},
+        JsonObject{}, [] { ExitProcess(79); });
+    return 3;
+}
 using Probe = int(__cdecl*)();
 extern "C" __declspec(dllexport) const char* gate(
     HKEY software, const wchar_t* journal, const wchar_t* lock, Probe during) {
@@ -135,7 +162,7 @@ extern "C" __declspec(dllexport) const char* probe(
     return probe
 
 
-def test_bridge_entry_checks_only_its_dedicated_journal(registry_probe, tmp_path):
+def test_bridge_entry_checks_only_its_dedicated_journal(registry_probe, interrupted_editor, tmp_path):
     # A sibling artifact with a broken marker must never be replayed. Even an
     # invalid request reaches the ownership/recovery gate before preflight.
     executable = registry_probe.executable
@@ -151,6 +178,23 @@ def test_bridge_entry_checks_only_its_dedicated_journal(registry_probe, tmp_path
     assert marker.parent.parent == unrelated.parent / "editor-isolation-journal"
     assert marker.parent.name.startswith("S-1-")
     assert not marker.exists()
+
+    # A valid marker in the private journal reaches the probe's HKCU denial.
+    _, _, private_marker, snapshot, _, _ = interrupted_editor
+    marker.parent.mkdir(parents=True)
+    shutil.copytree(snapshot.parent, marker.parent / snapshot.parent.name)
+    original = private_marker.read_bytes()
+    marker.write_bytes(original)
+    try:
+        result = subprocess.run([str(executable)], input=b"{}", capture_output=True, cwd=tmp_path)
+        response = json.loads(result.stdout)
+        assert result.returncode == 1 and response["stage"] == "registry-isolation", response
+        assert b"private probe denied HKCU open" in result.stderr
+        assert "open current user SOFTWARE for editor recovery" in response["message"]
+        assert response["diagnostics"]["editor_launched"] is False
+        assert marker.read_bytes() == original
+    finally:
+        marker.unlink(missing_ok=True)
 
 
 @pytest.fixture
@@ -207,6 +251,32 @@ def test_interrupted_registry_restored_before_new_transaction(interrupted_editor
     with winreg.OpenKey(hive, r"ColorizingDMD\Nested") as key:
         assert winreg.QueryValueEx(key, "raw") == (b"\x00\xff", winreg.REG_BINARY)
     assert invoke()["registry_recovery"]["restored"] is False
+
+
+def test_interrupted_marker_write_leaves_no_recovery_or_registry_changes(registry_probe, tmp_path):
+    import winreg
+
+    result = subprocess.run([str(registry_probe.executable), "--interrupt-marker", str(tmp_path)],
+                            capture_output=True, timeout=30)
+    assert result.returncode == 77, result.stderr
+    journal = tmp_path / "journal"
+    assert not (journal / "registry-incomplete.json").exists()
+    hive = ctypes.c_void_p()
+    api = ctypes.windll.advapi32
+    assert api.RegLoadAppKeyW(str(tmp_path / "fixture.hiv"), ctypes.byref(hive),
+                              winreg.KEY_ALL_ACCESS, 1, 0) == 0
+    try:
+        with pytest.raises(FileNotFoundError):
+            winreg.OpenKey(hive.value, "ColorizingDMD")
+        called = []
+        operation = ctypes.CFUNCTYPE(ctypes.c_int)(lambda: called.append(True) or 0)
+        retry = json.loads(registry_probe.gate(hive.value, str(journal),
+                                               "Local\\DMD-Retry-" + tmp_path.name, operation))
+        assert "error" not in retry, retry
+        assert retry["registry_recovery"]["restored"] is False
+        assert called == [True]
+    finally:
+        assert api.RegCloseKey(hive) == 0
 
 
 @pytest.mark.parametrize("blocker", ["process", "owner", "snapshot", "redirect", "restore"])
@@ -374,24 +444,29 @@ def test_registry_preparation_fails_before_artifacts_or_writes(registry_probe, t
         assert api.RegCloseKey(root) == 0
 
 
-def test_registry_artifact_collision_preserves_original(registry_probe, tmp_path):
+@pytest.mark.parametrize(("artifact", "diagnostic"), [
+    ("registry-snapshot.json", "create registry artifact"),
+    ("registry-incomplete.json", "publish registry marker"),
+])
+def test_registry_artifact_collision_preserves_original(registry_probe, tmp_path, artifact, diagnostic):
     import winreg
 
     root = ctypes.c_void_p()
     api = ctypes.windll.advapi32
     assert api.RegLoadAppKeyW(str(tmp_path / "fixture.hiv"), ctypes.byref(root),
                               winreg.KEY_ALL_ACCESS, 1, 0) == 0
-    snapshot = tmp_path / "registry-snapshot.json"
-    snapshot.write_bytes(b"earlier run")
+    existing = tmp_path / artifact
+    existing.write_bytes(b"earlier run")
     called = []
     callback = ctypes.CFUNCTYPE(ctypes.c_int)(lambda: called.append(True) or 0)
     try:
         evidence = json.loads(registry_probe(root.value, str(tmp_path), str(tmp_path / "project"), callback))
-        assert "create registry artifact" in evidence["error"]
+        assert diagnostic in evidence["error"]
         assert evidence["registry_transaction"]["verified"] is False
         assert not called
-        assert snapshot.read_bytes() == b"earlier run"
-        assert not (tmp_path / "registry-incomplete.json").exists()
+        assert existing.read_bytes() == b"earlier run"
+        if artifact == "registry-snapshot.json":
+            assert not (tmp_path / "registry-incomplete.json").exists()
         with pytest.raises(FileNotFoundError):
             winreg.OpenKey(root.value, "ColorizingDMD")
     finally:
@@ -472,11 +547,19 @@ def test_schema_accepts_success_and_error_responses(bridge_schema):
 
 
 @pytest.fixture
-def profile():
+def locked_profile():
     record, digest = _read_profile()
     del record["schema_version"], record["lock_scopes"]
     record["rom_members"] = tuple(RomMember(**member) for member in record["rom_members"])
     return Profile(**record, profile_sha256=digest)
+
+
+@pytest.fixture
+def profile(locked_profile, tmp_path):
+    # The adapter resolves this path when checking for installation overlap.
+    editor = locked_profile.components["ColorizingDMD editor"]
+    editor["provenance"]["installation_path"] = str(tmp_path / "installation")
+    return locked_profile
 
 
 @pytest.fixture
@@ -779,9 +862,10 @@ def test_adapter_retains_recovery_evidence_on_unverified_manifest(requested_proj
     assert failure.value.diagnostics == diagnostics
 
 
-def test_native_preflight_reports_missing_startup_texture(installed_artifacts, case, profile, tmp_path):
-    if not os.environ.get("DMD_EDITOR_BRIDGE_PATH"):
-        pytest.skip("set DMD_EDITOR_BRIDGE_PATH to the built x64 preflight executable")
+def test_native_preflight_reports_missing_startup_texture(
+    installed_artifacts, case, profile, tmp_path, registry_probe, monkeypatch,
+):
+    monkeypatch.setenv("DMD_EDITOR_BRIDGE_PATH", str(registry_probe.executable))
     source, decoder = installed_artifacts
     stage = stage_editor(source, tmp_path / "stage", profile, decoder_path=decoder)
     with pytest.raises(EditorBridgeError, match=r"textures[/\\]chiffres\.raw"):
@@ -790,16 +874,18 @@ def test_native_preflight_reports_missing_startup_texture(installed_artifacts, c
     assert response["status"] == "error"
     assert response["stage"] == "startup-assets"
     assert response["diagnostics"]["editor_launched"] is False
+    journal = Path(response["diagnostics"]["registry_recovery"]["marker_path"]).parent.parent
+    assert journal == registry_probe.executable.parent / "artifacts" / "editor-isolation-journal"
     assert response["diagnostics"]["decoder_sha256"] == PINNED_DECODER
     assert not (tmp_path / "project").exists()
 
 
 @pytest.mark.skipif(os.environ.get("DMD_EDITOR_ROUNDTRIP") != "1",
                     reason="set DMD_EDITOR_ROUNDTRIP=1 to require the original-editor round trip")
-def test_original_editor_roundtrip(installed_artifacts, case, profile, tmp_path):
+def test_original_editor_roundtrip(installed_artifacts, case, locked_profile, tmp_path):
     source, decoder = installed_artifacts
-    stage = stage_editor(source, tmp_path / "stage", profile, decoder_path=decoder)
-    result = write_project(tmp_path / "project", case, profile, editor_root=stage)
+    stage = stage_editor(source, tmp_path / "stage", locked_profile, decoder_path=decoder)
+    result = write_project(tmp_path / "project", case, locked_profile, editor_root=stage)
     manifest = json.loads(result.manifest_path.read_bytes())
     reopened = manifest["references"]
     assert [r["id"] for r in reopened] == ["A", "B", "C"]
