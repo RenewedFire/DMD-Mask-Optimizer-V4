@@ -2,6 +2,7 @@ import ctypes
 import hashlib
 import json
 import os
+import shutil
 import struct
 import subprocess
 from dataclasses import replace
@@ -29,7 +30,7 @@ def registry_probe(tmp_path_factory):
         pytest.skip("the registry transaction requires Windows")
     build = tmp_path_factory.mktemp("native-transaction")
     source = build / "probe.cpp"
-    source.write_text(r'''
+    source.write_text(f'#define DMD_REPOSITORY_ROOT LR"({build})"\n' + r'''
 #include <windows.h>
 #include <string_view>
 // Simulate a counted Win32 enumeration result that cannot be reopened
@@ -52,10 +53,38 @@ LSTATUS WINAPI probe_enum_value(HKEY k, DWORD i, LPWSTR name, LPDWORD length, LP
 }
 #define RegEnumKeyExW probe_enum_key
 #define RegEnumValueW probe_enum_value
+LSTATUS WINAPI private_open(HKEY key, LPCWSTR name, DWORD flags, REGSAM access, PHKEY result) {
+    if (key == HKEY_CURRENT_USER) return ERROR_ACCESS_DENIED;
+    return RegOpenKeyExW(key, name, flags, access, result);
+}
+#define RegOpenKeyExW private_open
 #define main editor_bridge_main
 #include "editor_bridge.cpp"
 #undef main
+int main() { return editor_bridge_main(); }
 using Probe = int(__cdecl*)();
+extern "C" __declspec(dllexport) const char* gate(
+    HKEY software, const wchar_t* journal, const wchar_t* lock, Probe during) {
+    init_apartment(apartment_type::multi_threaded);
+    static std::string result;
+    JsonObject observations;
+    try {
+        with_editor_isolation(journal, lock, [&] { return software; }, observations, [&] {
+            with_journaled_transaction(software, journal, {{L"DIR_SERUM", L"temporary"}},
+                observations, [&] { during(); });
+            return 0;
+        });
+    } catch (hresult_error const& error) {
+        observations.Insert(L"error", JsonValue::CreateStringValue(error.message()));
+    } catch (std::exception const& error) {
+        observations.Insert(L"error", JsonValue::CreateStringValue(to_hstring(error.what())));
+    }
+    result = to_string(observations.Stringify());
+    observations = nullptr;
+    clear_factory_cache();
+    uninit_apartment();
+    return result.c_str();
+}
 extern "C" __declspec(dllexport) const char* probe(
     HKEY software, const wchar_t* config, const wchar_t* project, Probe during) {
     init_apartment(apartment_type::multi_threaded);
@@ -89,15 +118,141 @@ extern "C" __declspec(dllexport) const char* probe(
     script = build / "compile.cmd"
     script.write_text(
         f'@call "{vcvars}" && cl /nologo /std:c++20 /EHsc /utf-8 /LD '
-        f'/I"{native}" probe.cpp windowsapp.lib advapi32.lib /link /out:probe.dll\n'
+        f'/I"{native}" probe.cpp windowsapp.lib advapi32.lib /link /out:probe.dll '
+        '&& link /nologo probe.obj windowsapp.lib advapi32.lib /subsystem:console /out:preflight.exe\n'
     )
     compiled = subprocess.run(["cmd", "/d", "/c", script.name], cwd=build,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     assert compiled.returncode == 0, compiled.stdout
-    probe = ctypes.CDLL(str(build / "probe.dll")).probe
+    library = ctypes.CDLL(str(build / "probe.dll"))
+    probe = library.probe
     probe.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.CFUNCTYPE(ctypes.c_int)]
     probe.restype = ctypes.c_char_p
+    probe.gate = library.gate
+    probe.gate.argtypes = probe.argtypes
+    probe.gate.restype = ctypes.c_char_p
+    probe.executable = build / "preflight.exe"
     return probe
+
+
+def test_bridge_entry_checks_only_its_dedicated_journal(registry_probe, tmp_path):
+    # A sibling artifact with a broken marker must never be replayed. Even an
+    # invalid request reaches the ownership/recovery gate before preflight.
+    executable = registry_probe.executable
+    unrelated = executable.parent / "artifacts" / "unrelated"
+    unrelated.mkdir(parents=True)
+    (unrelated / "registry-incomplete.json").write_text("{}")
+    result = subprocess.run([str(executable)], input=b"{}", capture_output=True, cwd=tmp_path)
+    response = json.loads(result.stdout)
+    assert result.returncode == 1 and response["stage"] == "request", response
+    observation = response["diagnostics"]["registry_recovery"]
+    assert observation["restored"] is False
+    marker = Path(observation["marker_path"])
+    assert marker.parent.parent == unrelated.parent / "editor-isolation-journal"
+    assert marker.parent.name.startswith("S-1-")
+    assert not marker.exists()
+
+
+@pytest.fixture
+def interrupted_editor(registry_probe, tmp_path):
+    import winreg
+
+    journal = tmp_path / "journal"
+    journal.mkdir()
+    run = journal / "previous"
+    run.mkdir()
+    snapshot = run / "registry-snapshot.json"
+    snapshot.write_text(json.dumps({"schema_version": 1, "existed": True, "root_name": "ColorizingDMD",
+                                    "keys": {"": {}, "Nested": {"raw": {"type": 3, "hex": "00ff"}}}}))
+    marker = journal / "registry-incomplete.json"
+    marker.write_text(json.dumps({"schema_version": 1, "run": run.name, "snapshot": snapshot.name,
+                                  "sha256": hashlib.sha256(snapshot.read_bytes()).hexdigest()}))
+    hive = ctypes.c_void_p()
+    api = ctypes.windll.advapi32
+    assert api.RegLoadAppKeyW(str(tmp_path / "fixture.hiv"), ctypes.byref(hive),
+                              winreg.KEY_ALL_ACCESS, 1, 0) == 0
+    lock = "Local\\DMD-Test-" + tmp_path.name
+    called = []
+    try:
+        with winreg.CreateKey(hive.value, "ColorizingDMD") as key:
+            winreg.SetValueEx(key, "dirty", 0, winreg.REG_SZ, "interrupted")
+
+        @ctypes.CFUNCTYPE(ctypes.c_int)
+        def operation():
+            called.append(json.loads(marker.read_bytes()))
+            return 0
+
+        def invoke():
+            return json.loads(registry_probe.gate(hive.value, str(journal), lock, operation))
+
+        yield invoke, hive.value, marker, snapshot, called, lock
+    finally:
+        assert api.RegCloseKey(hive) == 0
+
+
+def test_interrupted_registry_restored_before_new_transaction(interrupted_editor):
+    import winreg
+
+    invoke, hive, marker, snapshot, called, _ = interrupted_editor
+    result = invoke()
+    assert "error" not in result, result
+    assert result["registry_recovery"]["restored"] is True
+    assert Path(result["registry_recovery"]["snapshot_path"]) == snapshot
+    assert len(called) == 1
+    new_snapshot = marker.parent / called[0]["run"] / called[0]["snapshot"]
+    assert new_snapshot != snapshot
+    assert called[0]["sha256"] == hashlib.sha256(new_snapshot.read_bytes()).hexdigest()
+    assert json.loads(new_snapshot.read_bytes()) == json.loads(snapshot.read_bytes())
+    assert not marker.exists()
+    with winreg.OpenKey(hive, r"ColorizingDMD\Nested") as key:
+        assert winreg.QueryValueEx(key, "raw") == (b"\x00\xff", winreg.REG_BINARY)
+    assert invoke()["registry_recovery"]["restored"] is False
+
+
+@pytest.mark.parametrize("blocker", ["process", "owner", "snapshot", "redirect", "restore"])
+def test_gate_failure_retains_marker_and_blocks_transaction(interrupted_editor, tmp_path, blocker):
+    import winreg
+
+    invoke, hive, marker, snapshot, called, lock = interrupted_editor
+    process = None
+    owner = None
+    try:
+        if blocker == "process":
+            simulated = tmp_path / "ColorizingDMD.exe"
+            shutil.copyfile(Path(os.environ["SystemRoot"]) / "System32/cmd.exe", simulated)
+            process = subprocess.Popen([str(simulated), "/d", "/q"], stdin=subprocess.PIPE,
+                                       stdout=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+        elif blocker == "owner":
+            create_event = ctypes.windll.kernel32.CreateEventW
+            create_event.restype = ctypes.c_void_p
+            owner = ctypes.c_void_p(create_event(None, True, False, lock))
+            assert owner.value
+        elif blocker == "snapshot":
+            snapshot.write_text("{}")
+        elif blocker == "redirect":
+            record = json.loads(marker.read_bytes())
+            record["run"] = ".."
+            marker.write_text(json.dumps(record))
+        else:
+            # Simulate a non-restorable current key at the enumeration boundary.
+            with winreg.CreateKey(hive, r"ColorizingDMD\AliasXHidden"):
+                pass
+        original = marker.read_bytes()
+        result = invoke()
+        diagnostic = {"process": "ColorizingDMD.exe", "owner": "ownership", "snapshot": "digest",
+                      "redirect": "run", "restore": "embedded NUL"}[blocker]
+        assert diagnostic in result["error"], result
+        assert not called
+        assert marker.read_bytes() == original
+        assert set(marker.parent.iterdir()) == {marker, snapshot.parent}
+        with winreg.OpenKey(hive, "ColorizingDMD") as key:
+            assert winreg.QueryValueEx(key, "dirty") == ("interrupted", winreg.REG_SZ)
+    finally:
+        if process is not None:
+            process.stdin.close()
+            process.wait(timeout=5)
+        if owner:
+            assert ctypes.windll.kernel32.CloseHandle(owner)
 
 
 @pytest.mark.parametrize(("exists", "callback_error"), [(True, False), (False, False), (True, True)])
@@ -610,6 +765,16 @@ def test_bridge_error_exposes_registry_observations(requested_project, monkeypat
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(
         a, 1, json.dumps(response).encode(), b""))
     with pytest.raises(EditorBridgeError, match="registry-restore") as failure:
+        requested_project()
+    assert failure.value.diagnostics == diagnostics
+
+
+def test_adapter_retains_recovery_evidence_on_unverified_manifest(requested_project, monkeypatch):
+    diagnostics = {"registry_recovery": {"restored": True}}
+    response = {"schema_version": 1, "status": "ok", "diagnostics": diagnostics}
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(
+        a, 0, json.dumps(response).encode(), b""))
+    with pytest.raises(EditorBridgeError, match="round.trip manifest") as failure:
         requested_project()
     assert failure.value.diagnostics == diagnostics
 

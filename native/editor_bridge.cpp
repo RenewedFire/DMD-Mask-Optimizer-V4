@@ -1,5 +1,7 @@
 // Read-only startup preflight for the pinned Twister authoring build.
 #include <windows.h>
+#include <sddl.h>
+#include <tlhelp32.h>
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Security.Cryptography.h>
@@ -7,12 +9,14 @@
 #include <winrt/Windows.Storage.Streams.h>
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <functional>
 #include <map>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -225,13 +229,177 @@ void restore_settings(HKEY software, RegistrySnapshot const& before) {
         }
     }
 }
+
+void finish_restoration(HKEY software, RegistrySnapshot const& before, fs::path const& marker) {
+    restore_settings(software, before);
+    if (read_settings(software) != before)
+        throw std::runtime_error("restored registry differs from snapshot");
+    check_registry(RegFlushKey(software), "persist restored editor settings");
+    if (!DeleteFileW(marker.c_str()))
+        throw std::system_error(GetLastError(), std::system_category(), "remove registry marker");
+}
+
+// Open a single immutable view for both digest verification and JSON parsing.
+// A dangling reparse point is an error as well, never an absent marker.
+bool artifact_exists(fs::path const& path) {
+    auto attrs = GetFileAttributesW(path.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        auto error = GetLastError();
+        if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) return false;
+        throw std::system_error(error, std::system_category(), "inspect registry journal");
+    }
+    if (attrs & FILE_ATTRIBUTE_REPARSE_POINT)
+        throw std::runtime_error("redirected registry journal");
+    return true;
+}
+
+JsonObject read_journal_json(fs::path const& path, hstring const* expected_hash = nullptr) {
+    if (!artifact_exists(path) || !fs::is_regular_file(path) || fs::canonical(path) != path)
+        throw std::runtime_error("registry journal artifact is missing or redirected");
+    file_handle file(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+        OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    if (!file) throw std::system_error(GetLastError(), std::system_category(), "read registry journal");
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (!GetFileInformationByHandle(file.get(), &info))
+        throw std::system_error(GetLastError(), std::system_category(), "inspect registry artifact");
+    if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT || info.nNumberOfLinks != 1 ||
+        info.nFileSizeHigh || !info.nFileSizeLow)
+        throw std::runtime_error("invalid registry journal artifact");
+    std::string bytes(info.nFileSizeLow, '\0');
+    DWORD count{};
+    if (!ReadFile(file.get(), bytes.data(), info.nFileSizeLow, &count, nullptr) || count != bytes.size())
+        throw std::runtime_error("cannot read registry journal");
+    if (expected_hash) {
+        auto data = reinterpret_cast<uint8_t const*>(bytes.data());
+        auto buffer = CryptographicBuffer::CreateFromByteArray({data, data + count});
+        auto digest = HashAlgorithmProvider::OpenAlgorithm(L"SHA256").HashData(buffer);
+        if (CryptographicBuffer::EncodeToHexString(digest) != *expected_hash)
+            throw std::runtime_error("registry snapshot digest mismatch");
+    }
+    auto encoded = to_hstring(bytes);
+    if (to_string(encoded) != bytes) throw std::runtime_error("invalid UTF-8 registry journal");
+    return JsonObject::Parse(encoded);
+}
+
+struct RegistryNameLess {
+    bool operator()(std::wstring const& a, std::wstring const& b) const {
+        return CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_LESS_THAN;
+    }
+};
+
+RegistrySnapshot parse_snapshot(JsonObject const& json) {
+    if (json.GetNamedNumber(L"schema_version") != 1) throw std::runtime_error("unsupported registry snapshot");
+    bool existed = json.GetNamedBoolean(L"existed");
+    auto root = json.GetNamedString(L"root_name", existed ? settings_key : L"");
+    RegistrySnapshot result{restorable_name(root.c_str(), root.size()), {}};
+    if (existed ? _wcsicmp(result.root_name.c_str(), settings_key) != 0 : !result.root_name.empty())
+        throw std::runtime_error("invalid registry snapshot root");
+    std::set<std::wstring, RegistryNameLess> paths;
+    for (auto const& key : json.GetNamedObject(L"keys")) {
+        auto name = key.Key();
+        auto path = restorable_name(name.c_str(), name.size());
+        if (!paths.insert(path).second || (!path.empty() && (path.front() == L'\\' ||
+            path.back() == L'\\' || path.find(L"\\\\") != path.npos)))
+            throw std::runtime_error("invalid registry snapshot subkey");
+        auto& values = result.keys[path];
+        std::set<std::wstring, RegistryNameLess> names;
+        for (auto const& entry : key.Value().GetObject()) {
+            auto raw_name = entry.Key();
+            auto value_name = restorable_name(raw_name.c_str(), raw_name.size());
+            auto value = entry.Value().GetObject();
+            double type = value.GetNamedNumber(L"type");
+            if (!names.insert(value_name).second || type < 0 || type > MAXDWORD || std::floor(type) != type ||
+                (type == REG_LINK && _wcsicmp(value_name.c_str(), L"SymbolicLinkValue") == 0))
+                throw std::runtime_error("invalid registry snapshot value");
+            auto buffer = CryptographicBuffer::DecodeFromHexString(value.GetNamedString(L"hex"));
+            com_array<uint8_t> data;
+            CryptographicBuffer::CopyToByteArray(buffer, data);
+            values.emplace(value_name, std::make_pair(static_cast<DWORD>(type), Bytes(data.begin(), data.end())));
+        }
+    }
+    if (existed != !result.keys.empty() || (existed && !result.keys.contains(L"")))
+        throw std::runtime_error("inconsistent registry snapshot existence");
+    for (auto const& [path, values] : result.keys) {
+        auto split = path.rfind(L'\\');
+        if (split != path.npos && !result.keys.contains(path.substr(0, split)))
+            throw std::runtime_error("missing registry snapshot parent");
+    }
+    return result;
+}
+
+void require_editor_stopped() {
+    file_handle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+    if (!snapshot) throw std::system_error(GetLastError(), std::system_category(), "list editor processes");
+    PROCESSENTRY32W process{sizeof(PROCESSENTRY32W)};
+    if (!Process32FirstW(snapshot.get(), &process))
+        throw std::system_error(GetLastError(), std::system_category(), "inspect editor processes");
+    do {
+        if (_wcsicmp(process.szExeFile, L"ColorizingDMD.exe") == 0)
+            throw std::runtime_error("ColorizingDMD.exe is already running");
+    } while (Process32NextW(snapshot.get(), &process));
+    if (GetLastError() != ERROR_NO_MORE_FILES)
+        throw std::system_error(GetLastError(), std::system_category(), "enumerate editor processes");
+}
+
+void validate_journal(fs::path const& journal) {
+    if (!journal.is_absolute() || journal != journal.lexically_normal())
+        throw std::runtime_error("registry journal requires a canonical directory");
+    // The first run has no journal yet. Resolve its nearest existing directory
+    // directly without requiring permission to enumerate the drive root.
+    auto existing = journal;
+    while (!artifact_exists(existing)) {
+        if (existing == existing.root_path()) throw std::runtime_error("registry journal root is missing");
+        existing = existing.parent_path();
+    }
+    if (!fs::is_directory(existing) || fs::canonical(existing) != existing)
+        throw std::runtime_error("registry journal requires a canonical directory");
+    for (fs::path installation : {LR"(C:\DMD Colorization\ColorizingDMD)", LR"(C:\vPinball\ColorizingDMD)"})
+        if (overlaps(journal, installation) || overlaps(installation, journal))
+            throw std::runtime_error("registry journal overlaps an editor installation");
+}
+
+int with_editor_isolation(fs::path const& journal, wchar_t const* lock,
+    std::function<HKEY()> const& software, JsonObject const& diagnostics, std::function<int()> const& run) {
+    // Object lifetime, including kernel cleanup on process termination, owns the lock.
+    handle owner(CreateEventW(nullptr, TRUE, FALSE, lock));
+    auto status = GetLastError();
+    if (!owner || status == ERROR_ALREADY_EXISTS)
+        throw std::system_error(status, std::system_category(), "exclusive editor bridge ownership");
+    require_editor_stopped();
+    validate_journal(journal);
+    auto marker = journal / L"registry-incomplete.json";
+    JsonObject evidence;
+    evidence.Insert(L"restored", JsonValue::CreateBooleanValue(false));
+    evidence.Insert(L"marker_path", JsonValue::CreateStringValue(marker.native()));
+    diagnostics.Insert(L"registry_recovery", evidence);
+    if (artifact_exists(marker)) {
+        auto record = read_journal_json(marker);
+        auto run_id = record.GetNamedString(L"run");
+        if (run_id.empty() || std::wstring_view(run_id).find_first_not_of(
+            L"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_") != std::wstring_view::npos)
+            throw std::runtime_error("invalid registry journal run name");
+        if (record.GetNamedNumber(L"schema_version") != 1 ||
+            record.GetNamedString(L"snapshot") != L"registry-snapshot.json")
+            throw std::runtime_error("invalid registry journal marker");
+        auto previous = journal / run_id.c_str();
+        if (!artifact_exists(previous) || !fs::is_directory(previous))
+            throw std::runtime_error("missing registry journal run");
+        auto snapshot = previous / L"registry-snapshot.json";
+        evidence.Insert(L"snapshot_path", JsonValue::CreateStringValue(snapshot.native()));
+        auto digest = record.GetNamedString(L"sha256");
+        auto before = parse_snapshot(read_journal_json(snapshot, &digest));
+        finish_restoration(software(), before, marker);
+        evidence.SetNamedValue(L"restored", JsonValue::CreateBooleanValue(true));
+    }
+    return run();
+}
 } // namespace
 
 // The caller supplies HKCU\SOFTWARE after obtaining exclusive ownership.
 // Tests supply a private app hive. There is no request-controlled registry path.
 void with_registry_transaction(HKEY software, fs::path const& run_root, fs::path const& config,
     std::map<std::wstring, std::wstring> const& temporary_paths, JsonObject const& observations,
-    std::function<void()> const& run) {
+    std::function<void()> const& run, fs::path const& journal = {}) {
     for (auto const& dir : {run_root, config}) {
         if (!dir.is_absolute() || !fs::is_directory(dir) || fs::canonical(dir) != dir)
             throw std::runtime_error("registry artifacts require canonical generated directories");
@@ -243,7 +411,7 @@ void with_registry_transaction(HKEY software, fs::path const& run_root, fs::path
             throw std::runtime_error("registry artifacts overlap an editor installation");
     }
     auto snapshot = config / L"registry-snapshot.json";
-    auto marker = config / L"registry-incomplete.json";
+    auto marker = (journal.empty() ? config : journal) / L"registry-incomplete.json";
     JsonObject evidence;
     evidence.Insert(L"snapshot_path", JsonValue::CreateStringValue(snapshot.native()));
     evidence.Insert(L"marker_path", JsonValue::CreateStringValue(marker.native()));
@@ -254,6 +422,10 @@ void with_registry_transaction(HKEY software, fs::path const& run_root, fs::path
     JsonObject incomplete;
     incomplete.Insert(L"schema_version", JsonValue::CreateNumberValue(1));
     incomplete.Insert(L"snapshot", JsonValue::CreateStringValue(snapshot.filename().native()));
+    if (!journal.empty()) {
+        incomplete.Insert(L"run", JsonValue::CreateStringValue(config.filename().native()));
+        incomplete.Insert(L"sha256", JsonValue::CreateStringValue(file_hash(snapshot)));
+    }
     write_new_json(marker, incomplete);
 
     std::exception_ptr operation_error;
@@ -270,13 +442,20 @@ void with_registry_transaction(HKEY software, fs::path const& run_root, fs::path
     } catch (...) {
         operation_error = std::current_exception();
     }
-    restore_settings(software, before);
-    if (read_settings(software) != before)
-        throw std::runtime_error("restored registry differs from snapshot");
-    if (!DeleteFileW(marker.c_str()))
-        throw std::system_error(GetLastError(), std::system_category(), "remove registry marker");
+    finish_restoration(software, before, marker);
     evidence.SetNamedValue(L"verified", JsonValue::CreateBooleanValue(true));
     if (operation_error) std::rethrow_exception(operation_error);
+}
+
+void with_journaled_transaction(HKEY software, fs::path const& journal,
+    std::map<std::wstring, std::wstring> const& temporary_paths, JsonObject const& observations,
+    std::function<void()> const& run) {
+    validate_journal(journal);
+    fs::create_directories(journal);
+    auto id = CryptographicBuffer::EncodeToHexString(CryptographicBuffer::GenerateRandom(16));
+    auto dir = journal / id.c_str();
+    if (!fs::create_directory(dir)) throw std::runtime_error("registry journal run already exists");
+    with_registry_transaction(software, journal, dir, temporary_paths, observations, run, journal);
 }
 
 int failure(hstring const& stage, hstring const& message, JsonObject const& diagnostics) {
@@ -323,17 +502,54 @@ int preflight(JsonObject const& request, JsonObject const& diagnostics) {
     return failure(L"config-isolation", L"The editor reads and writes HKCU\\SOFTWARE\\ColorizingDMD. An isolated profile is required before launch.", diagnostics);
 }
 
+fs::path production_journal() {
+#ifdef DMD_REPOSITORY_ROOT
+    // Never derive recovery paths from request JSON, cwd or the staged editor.
+    // A shared checkout can be used by distinct Windows users with different HKCU hives.
+    handle token;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, token.put()))
+        throw std::system_error(GetLastError(), std::system_category(), "open current user token");
+    DWORD length{};
+    GetTokenInformation(token.get(), TokenUser, nullptr, 0, &length);
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER)
+        throw std::system_error(GetLastError(), std::system_category(), "size current user identity");
+    Bytes data(length);
+    if (!GetTokenInformation(token.get(), TokenUser, data.data(), length, &length))
+        throw std::system_error(GetLastError(), std::system_category(), "read current user identity");
+    wchar_t* sid{};
+    if (!ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(data.data())->User.Sid, &sid))
+        throw std::system_error(GetLastError(), std::system_category(), "format current user identity");
+    std::unique_ptr<wchar_t, decltype(&LocalFree)> user(sid, LocalFree);
+    return fs::path(DMD_REPOSITORY_ROOT) / L"artifacts" / L"editor-isolation-journal" / user.get();
+#else
+    throw std::runtime_error("build the production bridge with its repository recovery root");
+#endif
+}
+
 int main() {
     try {
         init_apartment(apartment_type::multi_threaded);
         JsonObject diagnostics;
         diagnostics.Insert(L"editor_launched", JsonValue::CreateBooleanValue(false));
+        hstring stage = L"registry-isolation";
         try {
-            return preflight(JsonObject::Parse(to_hstring(read_request())), diagnostics);
+            Key software;
+            auto journal = production_journal();
+            auto owner = L"Global\\DMDMaskOptimizer-EditorIsolation-" + journal.filename().wstring();
+            return with_editor_isolation(journal, owner.c_str(), [&] {
+                HKEY key{};
+                check_registry(RegOpenKeyExW(HKEY_CURRENT_USER, L"SOFTWARE", 0, KEY_READ | KEY_WRITE, &key),
+                    "open current user SOFTWARE for editor recovery");
+                software.reset(key);
+                return software.get();
+            }, diagnostics, [&] {
+                stage = L"request";
+                return preflight(JsonObject::Parse(to_hstring(read_request())), diagnostics);
+            });
         } catch (hresult_error const& error) {
-            return failure(L"request", error.message(), diagnostics);
+            return failure(stage, error.message(), diagnostics);
         } catch (std::exception const& error) {
-            return failure(L"request", to_hstring(error.what()), diagnostics);
+            return failure(stage, to_hstring(error.what()), diagnostics);
         }
     } catch (...) {
         std::cerr << "Cannot initialize or emit the Windows JSON preflight response\n";

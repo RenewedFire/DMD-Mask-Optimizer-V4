@@ -252,14 +252,17 @@ def write_project(
     if (not isinstance(response, dict) or type(response.get("schema_version")) is not int
             or response["schema_version"] != 1):
         raise EditorBridgeError(f"invalid editor bridge schema version; see {config}")
+    observations = response.get("diagnostics")
+    diagnostics = observations if isinstance(observations, dict) else None
     if response.get("status") == "error":
-        diagnostics = response.get("diagnostics")
         raise EditorBridgeError(
             f"editor bridge {response.get('stage')} (exit code {result.returncode}): "
             f"{response.get('message')}; see {config}",
-            diagnostics=diagnostics if isinstance(diagnostics, dict) else None,
+            diagnostics=diagnostics,
         )
     if result.returncode:
-        raise EditorBridgeError(f"editor bridge exit code {result.returncode}; see {config}")
+        raise EditorBridgeError(f"editor bridge exit code {result.returncode}; see {config}",
+                                diagnostics=diagnostics)
     # The capability probe cannot attest to a save, reopen, or export.
-    raise EditorBridgeError(f"no verified original-editor round-trip manifest; see {config}")
+    raise EditorBridgeError(f"no verified original-editor round-trip manifest; see {config}",
+                            diagnostics=diagnostics)
