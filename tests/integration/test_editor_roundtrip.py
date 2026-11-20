@@ -30,6 +30,28 @@ def registry_probe(tmp_path_factory):
     build = tmp_path_factory.mktemp("native-transaction")
     source = build / "probe.cpp"
     source.write_text(r'''
+#include <windows.h>
+#include <string_view>
+// Simulate a counted Win32 enumeration result that cannot be reopened
+// through a null-terminated name. All actual registry I/O stays in the app hive.
+void simulate_counted_name(LSTATUS status, wchar_t* name, DWORD length) {
+    if (status == ERROR_SUCCESS && std::wstring_view(name, length) == L"AliasXHidden")
+        name[5] = L'\0';
+}
+LSTATUS WINAPI probe_enum_key(HKEY k, DWORD i, LPWSTR name, LPDWORD length, LPDWORD reserved,
+    LPWSTR cls, LPDWORD cls_length, PFILETIME time) {
+    auto status = RegEnumKeyExW(k, i, name, length, reserved, cls, cls_length, time);
+    simulate_counted_name(status, name, *length);
+    return status;
+}
+LSTATUS WINAPI probe_enum_value(HKEY k, DWORD i, LPWSTR name, LPDWORD length, LPDWORD reserved,
+    LPDWORD type, LPBYTE data, LPDWORD size) {
+    auto status = RegEnumValueW(k, i, name, length, reserved, type, data, size);
+    simulate_counted_name(status, name, *length);
+    return status;
+}
+#define RegEnumKeyExW probe_enum_key
+#define RegEnumValueW probe_enum_value
 #define main editor_bridge_main
 #include "editor_bridge.cpp"
 #undef main
@@ -40,7 +62,8 @@ extern "C" __declspec(dllexport) const char* probe(
     static std::string result;
     JsonObject observations;
     try {
-        with_registry_transaction(software, config, {{L"DIR_SERUM", project}}, observations, [&] {
+        with_registry_transaction(software, fs::path(project).parent_path(), config,
+            {{L"DIR_SERUM", project}}, observations, [&] {
             if (during()) throw std::runtime_error("simulated editor failure");
         });
     } catch (hresult_error const& error) {
@@ -90,7 +113,7 @@ def test_native_registry_transaction(registry_probe, tmp_path, exists, callback_
     status = api.RegLoadAppKeyW(str(config / "fixture.hiv"), ctypes.byref(root),
                                 winreg.KEY_ALL_ACCESS, 1, 0)
     assert status == 0
-    key_name = "ColorizingDMD"
+    key_name = "CoLoRiZiNgDmD"
     nested = key_name + r"\Nested\空"
     blob = bytes(range(256)) * 12
     snapshot = config / "registry-snapshot.json"
@@ -126,6 +149,7 @@ def test_native_registry_transaction(registry_probe, tmp_path, exists, callback_
         incomplete, before, temporary_value = during[0]
         assert incomplete["snapshot"] == snapshot.name
         assert before["existed"] is exists
+        assert before["root_name"] == (key_name if exists else "")
         assert temporary_value == (str(project), winreg.REG_SZ)
         assert json.loads(snapshot.read_bytes()) == before
         assert not marker.exists()
@@ -140,6 +164,7 @@ def test_native_registry_transaction(registry_probe, tmp_path, exists, callback_
         with winreg.OpenKey(root.value, "Sibling") as key:
             assert winreg.QueryValueEx(key, "") == ("preserved", winreg.REG_SZ)
         if exists:
+            assert {winreg.EnumKey(root.value, i) for i in range(2)} == {"Sibling", key_name}
             with winreg.OpenKey(root.value, nested) as key:
                 assert winreg.QueryValueEx(key, "") == (blob, winreg.REG_BINARY)
                 assert winreg.QueryValueEx(key, "多") == (0xDEADBEEF, winreg.REG_DWORD)
@@ -152,6 +177,44 @@ def test_native_registry_transaction(registry_probe, tmp_path, exists, callback_
         else:
             with pytest.raises(FileNotFoundError):
                 winreg.OpenKey(root.value, key_name)
+    finally:
+        assert api.RegCloseKey(root) == 0
+
+
+@pytest.mark.parametrize("invalid", ["outside-run", "value-name", "subkey-name"])
+def test_registry_preparation_fails_before_artifacts_or_writes(registry_probe, tmp_path, invalid):
+    import winreg
+
+    run = tmp_path / "generated-run"
+    run.mkdir()
+    config = (tmp_path if invalid == "outside-run" else run) / "config"
+    config.mkdir()
+    root = ctypes.c_void_p()
+    api = ctypes.windll.advapi32
+    assert api.RegLoadAppKeyW(str(run / "fixture.hiv"), ctypes.byref(root),
+                              winreg.KEY_ALL_ACCESS, 1, 0) == 0
+    called = []
+    callback = ctypes.CFUNCTYPE(ctypes.c_int)(lambda: called.append(True) or 0)
+    try:
+        with winreg.CreateKey(root.value, "ColorizingDMD") as key:
+            if invalid == "value-name":
+                winreg.SetValueEx(key, "Alias", 0, winreg.REG_BINARY, b"preserve")
+                winreg.SetValueEx(key, "AliasXHidden", 0, winreg.REG_BINARY, b"hidden")
+            if invalid == "subkey-name":
+                with winreg.CreateKey(key, "Alias"):
+                    pass
+                with winreg.CreateKey(key, "AliasXHidden"):
+                    pass
+        evidence = json.loads(registry_probe(root.value, str(config), str(run / "project"), callback))
+        assert not called, evidence
+        assert "error" in evidence
+        assert list(config.iterdir()) == []
+        with winreg.OpenKey(root.value, "ColorizingDMD") as key:
+            assert winreg.QueryInfoKey(key)[:2] == {
+                "outside-run": (0, 0), "value-name": (0, 2), "subkey-name": (2, 0),
+            }[invalid]
+            if invalid == "value-name":
+                assert winreg.QueryValueEx(key, "Alias") == (b"preserve", winreg.REG_BINARY)
     finally:
         assert api.RegCloseKey(root) == 0
 

@@ -81,6 +81,12 @@ using Values = std::map<std::wstring, std::pair<DWORD, Bytes>>;
 // Empty map: subtree absent. Empty relative path: the subtree's root.
 using RegistryTree = std::map<std::wstring, Values>;
 
+struct RegistrySnapshot {
+    std::wstring root_name;
+    RegistryTree keys;
+    bool operator==(RegistrySnapshot const&) const = default;
+};
+
 struct CloseKey {
     void operator()(HKEY key) const noexcept { RegCloseKey(key); }
 };
@@ -106,6 +112,13 @@ Key create_key(HKEY parent, std::wstring const& name) {
     return Key(handle);
 }
 
+std::wstring restorable_name(wchar_t const* buffer, DWORD length) {
+    std::wstring name(buffer, length);
+    if (name.find(L'\0') != std::wstring::npos)
+        throw std::runtime_error("registry name contains an embedded NUL and cannot be restored");
+    return name;
+}
+
 void enumerate_key(HKEY key, std::wstring const& path, RegistryTree& tree) {
     DWORD max_child{}, max_name{}, max_data{};
     check_registry(RegQueryInfoKeyW(key, nullptr, nullptr, nullptr, nullptr, &max_child, nullptr,
@@ -118,7 +131,7 @@ void enumerate_key(HKEY key, std::wstring const& path, RegistryTree& tree) {
         auto status = RegEnumValueW(key, i, name.data(), &length, nullptr, &type, data.data(), &size);
         if (status == ERROR_NO_MORE_ITEMS) break;
         check_registry(status, "read registry value");
-        std::wstring value_name(name.data(), length);
+        auto value_name = restorable_name(name.data(), length);
         if (type == REG_LINK && _wcsicmp(value_name.c_str(), L"SymbolicLinkValue") == 0)
             throw std::runtime_error("registry link inside editor settings");
         values.emplace(std::move(value_name), std::make_pair(type, Bytes(data.begin(), data.begin() + size)));
@@ -128,21 +141,39 @@ void enumerate_key(HKEY key, std::wstring const& path, RegistryTree& tree) {
         auto status = RegEnumKeyExW(key, i, name.data(), &length, nullptr, nullptr, nullptr, nullptr);
         if (status == ERROR_NO_MORE_ITEMS) break;
         check_registry(status, "enumerate registry subkey");
-        std::wstring child(name.data(), length);
+        auto child = restorable_name(name.data(), length);
         auto subkey = open_key(key, child.c_str());
         enumerate_key(subkey.get(), path.empty() ? child : path + L"\\" + child, tree);
     }
 }
 
-RegistryTree read_settings(HKEY software) {
-    RegistryTree tree;
-    if (auto key = open_key(software, settings_key, true)) enumerate_key(key.get(), L"", tree);
-    return tree;
+RegistrySnapshot read_settings(HKEY software) {
+    RegistrySnapshot snapshot;
+    auto key = open_key(software, settings_key, true);
+    if (!key) return snapshot;
+    // Opening a registry key ignores case. Enumerate its parent to preserve
+    // the spelling that should be recreated even if the editor removes it.
+    DWORD max_name{};
+    check_registry(RegQueryInfoKeyW(software, nullptr, nullptr, nullptr, nullptr, &max_name,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr), "size registry parent");
+    std::vector<wchar_t> name(1ULL + max_name);
+    for (DWORD i = 0; ; ++i) {
+        DWORD length = static_cast<DWORD>(name.size());
+        auto status = RegEnumKeyExW(software, i, name.data(), &length, nullptr, nullptr, nullptr, nullptr);
+        check_registry(status, "find original editor key name");
+        if (length == std::size(settings_key) - 1 &&
+            CompareStringOrdinal(name.data(), length, settings_key, -1, TRUE) == CSTR_EQUAL) {
+            snapshot.root_name = restorable_name(name.data(), length);
+            break;
+        }
+    }
+    enumerate_key(key.get(), L"", snapshot.keys);
+    return snapshot;
 }
 
-JsonObject snapshot_json(RegistryTree const& tree) {
+JsonObject snapshot_json(RegistrySnapshot const& before) {
     JsonObject keys;
-    for (auto const& [path, values] : tree) {
+    for (auto const& [path, values] : before.keys) {
         JsonObject entries;
         for (auto const& [name, value] : values) {
             JsonObject entry;
@@ -155,7 +186,8 @@ JsonObject snapshot_json(RegistryTree const& tree) {
     }
     JsonObject snapshot;
     snapshot.Insert(L"schema_version", JsonValue::CreateNumberValue(1));
-    snapshot.Insert(L"existed", JsonValue::CreateBooleanValue(!tree.empty()));
+    snapshot.Insert(L"existed", JsonValue::CreateBooleanValue(!before.keys.empty()));
+    snapshot.Insert(L"root_name", JsonValue::CreateStringValue(before.root_name));
     snapshot.Insert(L"keys", keys);
     return snapshot;
 }
@@ -175,16 +207,16 @@ void write_new_json(fs::path const& path, JsonObject const& json) {
         throw std::system_error(GetLastError(), std::system_category(), "persist registry artifact");
 }
 
-void restore_settings(HKEY software, RegistryTree const& before) {
+void restore_settings(HKEY software, RegistrySnapshot const& before) {
     // Refuse any links added during the editor operation before traversing a
     // subtree for deletion. All calls are anchored to the injected SOFTWARE key.
     auto current = read_settings(software);
     if (current == before) return;
-    if (!current.empty())
+    if (!current.keys.empty())
         check_registry(RegDeleteTreeW(software, settings_key), "remove temporary editor settings");
-    if (before.empty()) return;
-    auto root = create_key(software, settings_key);
-    for (auto const& [path, values] : before) {
+    if (before.keys.empty()) return;
+    auto root = create_key(software, before.root_name);
+    for (auto const& [path, values] : before.keys) {
         auto child = path.empty() ? Key{} : create_key(root.get(), path);
         for (auto const& [name, value] : values) {
             check_registry(RegSetValueExW(child ? child.get() : root.get(), name.c_str(), 0,
@@ -197,11 +229,15 @@ void restore_settings(HKEY software, RegistryTree const& before) {
 
 // The caller supplies HKCU\SOFTWARE after obtaining exclusive ownership.
 // Tests supply a private app hive. There is no request-controlled registry path.
-void with_registry_transaction(HKEY software, fs::path const& config,
+void with_registry_transaction(HKEY software, fs::path const& run_root, fs::path const& config,
     std::map<std::wstring, std::wstring> const& temporary_paths, JsonObject const& observations,
     std::function<void()> const& run) {
-    if (!config.is_absolute() || !fs::is_directory(config) || fs::canonical(config) != config)
-        throw std::runtime_error("registry artifacts require a canonical generated directory");
+    for (auto const& dir : {run_root, config}) {
+        if (!dir.is_absolute() || !fs::is_directory(dir) || fs::canonical(dir) != dir)
+            throw std::runtime_error("registry artifacts require canonical generated directories");
+    }
+    if (std::mismatch(run_root.begin(), run_root.end(), config.begin(), config.end()).first != run_root.end())
+        throw std::runtime_error("registry artifacts must be inside the generated run root");
     for (fs::path installation : {LR"(C:\DMD Colorization\ColorizingDMD)", LR"(C:\vPinball\ColorizingDMD)"}) {
         if (overlaps(config, installation) || overlaps(installation, config))
             throw std::runtime_error("registry artifacts overlap an editor installation");
