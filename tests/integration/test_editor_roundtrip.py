@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import struct
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 
@@ -332,15 +333,81 @@ def test_serialized_request_preserves_order_pixels_and_masks(
 
 
 def test_write_project_expects_missing_bridge_after_validation(
-    installed_artifacts, case, profile, tmp_path,
+    installed_artifacts, case, profile, tmp_path, monkeypatch,
 ):
     source, decoder = installed_artifacts
     staged = stage_editor(source, tmp_path / "stage", profile, decoder_path=decoder)
 
+    monkeypatch.setenv("DMD_EDITOR_BRIDGE_PATH", str(tmp_path / "missing-editor_bridge.exe"))
     with pytest.raises(EditorBridgeError, match="editor_bridge.exe.*unavailable"):
         write_project(tmp_path / "project", case, profile, editor_root=staged)
 
 
-@pytest.mark.skip(reason="editor_bridge.exe is missing pending native bridge implementation")
-def test_original_editor_roundtrip(case, profile):
-    """Reserved for the native original-editor round-trip test."""
+@pytest.fixture
+def requested_project(case, profile, tmp_path, monkeypatch):
+    # Exercise process transport independently of the local vendor files.
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    monkeypatch.setattr("dmd_optimizer.adapters.editor._verify_staged_file", lambda *_: None)
+    bridge = tmp_path / "editor_bridge.exe"
+    bridge.touch()
+    monkeypatch.setenv("DMD_EDITOR_BRIDGE_PATH", str(bridge))
+    return lambda: write_project(tmp_path / "project", case, profile, editor_root=stage)
+
+
+@pytest.mark.parametrize(
+    ("status", "stdout", "expected"),
+    [
+        (0, b"", "JSON response"),
+        (0, b'{"schema_version":2,"status":"ok"}', "schema version"),
+        (0, b'{"schema_version":1,"status":"ok"}', "round.trip manifest"),
+        (7, b"", "exit code 7"),
+    ],
+)
+def test_bridge_rejects_unverified_results(requested_project, monkeypatch, status, stdout, expected):
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(a, status, stdout, b""))
+    with pytest.raises(EditorBridgeError, match=expected):
+        requested_project()
+
+
+def test_bridge_timeout_retains_diagnostics(requested_project, monkeypatch, tmp_path):
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(args[0], kwargs["timeout"], output=b"started", stderr=b"partial")
+
+    monkeypatch.setattr(subprocess, "run", timeout)
+    with pytest.raises(EditorBridgeError, match="timed out"):
+        requested_project()
+    config = tmp_path / "project-editor-config"
+    assert (config / "bridge.stdout").read_bytes() == b"started"
+    assert (config / "bridge.stderr").read_bytes() == b"partial"
+
+
+def test_native_preflight_reports_missing_startup_texture(installed_artifacts, case, profile, tmp_path):
+    if not os.environ.get("DMD_EDITOR_BRIDGE_PATH"):
+        pytest.skip("set DMD_EDITOR_BRIDGE_PATH to the built x64 preflight executable")
+    source, decoder = installed_artifacts
+    stage = stage_editor(source, tmp_path / "stage", profile, decoder_path=decoder)
+    with pytest.raises(EditorBridgeError, match=r"textures[/\\]chiffres\.raw"):
+        write_project(tmp_path / "project", case, profile, editor_root=stage)
+    response = json.loads((tmp_path / "project-editor-config" / "bridge.stdout").read_bytes())
+    assert response["status"] == "error"
+    assert response["stage"] == "startup-assets"
+    assert response["diagnostics"]["editor_launched"] is False
+    assert response["diagnostics"]["decoder_sha256"] == PINNED_DECODER
+    assert not (tmp_path / "project").exists()
+
+
+@pytest.mark.skipif(os.environ.get("DMD_EDITOR_ROUNDTRIP") != "1",
+                    reason="set DMD_EDITOR_ROUNDTRIP=1 to require the original-editor round trip")
+def test_original_editor_roundtrip(installed_artifacts, case, profile, tmp_path):
+    source, decoder = installed_artifacts
+    stage = stage_editor(source, tmp_path / "stage", profile, decoder_path=decoder)
+    result = write_project(tmp_path / "project", case, profile, editor_root=stage)
+    manifest = json.loads(result.manifest_path.read_bytes())
+    reopened = manifest["references"]
+    assert [r["id"] for r in reopened] == ["A", "B", "C"]
+    assert [bytes(r["native_pixels"]) for r in reopened] == [r.native_pixels for r in case]
+    assert manifest["custom_mask_count"] == 1
+    assert reopened[0]["slot"] == reopened[1]["slot"] != reopened[2]["slot"]
+    assert reopened[2]["slot"] == manifest["unmasked_sentinel"]
+    assert result.runtime_export.is_file()

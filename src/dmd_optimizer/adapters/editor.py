@@ -2,7 +2,9 @@
 
 import hashlib
 import json
+import os
 import shutil
+import subprocess
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -211,7 +213,47 @@ def serialize_request(
 
 def write_project(
     folder: Path, refs: Sequence[Reference], profile: Profile, *, editor_root: Path | None = None,
+    deadline_ms: int = 60_000,
 ) -> ProjectFiles:
-    """Validate the requested project and require the original-editor bridge."""
-    serialize_request(folder, refs, profile, editor_root=editor_root)
-    raise EditorBridgeError("editor_bridge.exe is unavailable pending native bridge implementation")
+    """Run the original-editor preflight and retain its diagnostics in a fresh config root."""
+    request = serialize_request(folder, refs, profile, editor_root=editor_root, deadline_ms=deadline_ms)
+    default_bridge = Path(__file__).resolve().parents[3] / "build" / "editor_bridge.exe"
+    bridge = Path(os.environ.get("DMD_EDITOR_BRIDGE_PATH", default_bridge)).resolve()
+    if not bridge.is_file():
+        raise EditorBridgeError(f"editor_bridge.exe is unavailable at {bridge}")
+
+    config = Path(json.loads(request)["config_root"])
+    try:
+        config.mkdir(parents=True, exist_ok=False)
+        try:
+            result = subprocess.run(
+                [str(bridge)], input=request.encode("utf-8"), capture_output=True,
+                cwd=config, timeout=deadline_ms / 1000, check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            (config / "bridge.stdout").write_bytes(exc.stdout or b"")
+            (config / "bridge.stderr").write_bytes(exc.stderr or b"")
+            raise EditorBridgeError(f"editor bridge timed out after {deadline_ms} ms; see {config}") from exc
+        (config / "bridge.stdout").write_bytes(result.stdout)
+        (config / "bridge.stderr").write_bytes(result.stderr)
+    except OSError as exc:
+        raise EditorBridgeError(f"cannot run editor bridge with fresh config {config}: {exc}") from exc
+
+    try:
+        response = json.loads(result.stdout.decode("utf-8"))
+    except (UnicodeError, ValueError) as exc:
+        raise EditorBridgeError(
+            f"editor bridge exit code {result.returncode}, invalid JSON response; see {config}"
+        ) from exc
+    if (not isinstance(response, dict) or type(response.get("schema_version")) is not int
+            or response["schema_version"] != 1):
+        raise EditorBridgeError(f"invalid editor bridge schema version; see {config}")
+    if response.get("status") == "error":
+        raise EditorBridgeError(
+            f"editor bridge {response.get('stage')} (exit code {result.returncode}): "
+            f"{response.get('message')}; see {config}"
+        )
+    if result.returncode:
+        raise EditorBridgeError(f"editor bridge exit code {result.returncode}; see {config}")
+    # The capability probe cannot attest to a save, reopen, or export.
+    raise EditorBridgeError(f"no verified original-editor round-trip manifest; see {config}")

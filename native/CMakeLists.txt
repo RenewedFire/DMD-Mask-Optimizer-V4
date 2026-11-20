@@ -1,0 +1,12 @@
+cmake_minimum_required(VERSION 3.20)
+project(editor_bridge LANGUAGES CXX)
+
+if(NOT WIN32 OR NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+    message(FATAL_ERROR "The editor bridge requires Windows x64 MSVC and the Windows SDK")
+endif()
+
+add_executable(editor_bridge editor_bridge.cpp)
+target_compile_features(editor_bridge PRIVATE cxx_std_20)
+target_compile_options(editor_bridge PRIVATE /W4 /EHsc /utf-8)
+target_link_libraries(editor_bridge PRIVATE windowsapp)
+set_target_properties(editor_bridge PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}>")
