@@ -21,6 +21,10 @@ _DECODER = "bundled decoder"
 class EditorBridgeError(RuntimeError):
     """The editor inputs, staging, or bridge operation could not be verified."""
 
+    def __init__(self, message: str, *, diagnostics: Mapping[str, object] | None = None):
+        super().__init__(message)
+        self.diagnostics = dict(diagnostics or {})
+
 
 @dataclass(frozen=True)
 class Reference:
@@ -249,9 +253,11 @@ def write_project(
             or response["schema_version"] != 1):
         raise EditorBridgeError(f"invalid editor bridge schema version; see {config}")
     if response.get("status") == "error":
+        diagnostics = response.get("diagnostics")
         raise EditorBridgeError(
             f"editor bridge {response.get('stage')} (exit code {result.returncode}): "
-            f"{response.get('message')}; see {config}"
+            f"{response.get('message')}; see {config}",
+            diagnostics=diagnostics if isinstance(diagnostics, dict) else None,
         )
     if result.returncode:
         raise EditorBridgeError(f"editor bridge exit code {result.returncode}; see {config}")

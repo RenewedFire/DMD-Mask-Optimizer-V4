@@ -1,3 +1,4 @@
+import ctypes
 import hashlib
 import json
 import os
@@ -20,6 +21,163 @@ from scripts.lock_profile import Profile, RomMember, _read_profile
 
 
 PINNED_DECODER = "da71fa73e838ab3e257a2a73c8f74d88a3336615930761fa494a251822e0c2d5"
+
+
+@pytest.fixture(scope="module")
+def registry_probe(tmp_path_factory):
+    if os.name != "nt":
+        pytest.skip("the registry transaction requires Windows")
+    build = tmp_path_factory.mktemp("native-transaction")
+    source = build / "probe.cpp"
+    source.write_text(r'''
+#define main editor_bridge_main
+#include "editor_bridge.cpp"
+#undef main
+using Probe = int(__cdecl*)();
+extern "C" __declspec(dllexport) const char* probe(
+    HKEY software, const wchar_t* config, const wchar_t* project, Probe during) {
+    init_apartment(apartment_type::multi_threaded);
+    static std::string result;
+    JsonObject observations;
+    try {
+        with_registry_transaction(software, config, {{L"DIR_SERUM", project}}, observations, [&] {
+            if (during()) throw std::runtime_error("simulated editor failure");
+        });
+    } catch (hresult_error const& error) {
+        observations.Insert(L"error", JsonValue::CreateStringValue(error.message()));
+    } catch (std::exception const& error) {
+        observations.Insert(L"error", JsonValue::CreateStringValue(to_hstring(error.what())));
+    }
+    result = to_string(observations.Stringify());
+    observations = nullptr;
+    clear_factory_cache();
+    uninit_apartment();
+    return result.c_str();
+}
+''', encoding="utf-8")
+    # Use the same x64 MSVC and Windows SDK required by native/CMakeLists.txt.
+    locator = Path(os.environ["ProgramFiles(x86)"]) / "Microsoft Visual Studio/Installer/vswhere.exe"
+    install = subprocess.check_output([
+        str(locator), "-all", "-products", "*", "-property", "installationPath",
+    ], text=True).splitlines()
+    vcvars = next(path for root in install
+                  if (path := Path(root) / "VC/Auxiliary/Build/vcvars64.bat").is_file())
+    native = Path(__file__).resolve().parents[2] / "native"
+    script = build / "compile.cmd"
+    script.write_text(
+        f'@call "{vcvars}" && cl /nologo /std:c++20 /EHsc /utf-8 /LD '
+        f'/I"{native}" probe.cpp windowsapp.lib advapi32.lib /link /out:probe.dll\n'
+    )
+    compiled = subprocess.run(["cmd", "/d", "/c", script.name], cwd=build,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    assert compiled.returncode == 0, compiled.stdout
+    probe = ctypes.CDLL(str(build / "probe.dll")).probe
+    probe.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.CFUNCTYPE(ctypes.c_int)]
+    probe.restype = ctypes.c_char_p
+    return probe
+
+
+@pytest.mark.parametrize(("exists", "callback_error"), [(True, False), (False, False), (True, True)])
+def test_native_registry_transaction(registry_probe, tmp_path, exists, callback_error):
+    import winreg
+
+    config = tmp_path / "config"
+    config.mkdir()
+    project = tmp_path / "project"
+    root = ctypes.c_void_p()
+    api = ctypes.windll.advapi32
+    # REG_PROCESS_APPKEY binds this fresh, file-backed hive to the pytest process.
+    status = api.RegLoadAppKeyW(str(config / "fixture.hiv"), ctypes.byref(root),
+                                winreg.KEY_ALL_ACCESS, 1, 0)
+    assert status == 0
+    key_name = "ColorizingDMD"
+    nested = key_name + r"\Nested\空"
+    blob = bytes(range(256)) * 12
+    snapshot = config / "registry-snapshot.json"
+    marker = config / "registry-incomplete.json"
+    during = []
+    try:
+        with winreg.CreateKey(root.value, "Sibling") as sibling:
+            winreg.SetValueEx(sibling, "", 0, winreg.REG_SZ, "preserved")
+        if exists:
+            with winreg.CreateKey(root.value, nested) as key:
+                winreg.SetValueEx(key, "", 0, winreg.REG_BINARY, blob)
+                winreg.SetValueEx(key, "多", 0, winreg.REG_DWORD, 0xDEADBEEF)
+            with winreg.CreateKey(root.value, key_name + r"\Empty"):
+                pass
+            with winreg.OpenKey(root.value, key_name, 0, winreg.KEY_WRITE) as key:
+                winreg.SetValueEx(key, "DIR_SERUM", 0, winreg.REG_BINARY, b"before")
+
+        @ctypes.CFUNCTYPE(ctypes.c_int)
+        def edit():
+            try:
+                with winreg.OpenKey(root.value, key_name) as key:
+                    setting = winreg.QueryValueEx(key, "DIR_SERUM")
+                with winreg.CreateKey(root.value, key_name + r"\EditorCreated") as key:
+                    winreg.SetValueEx(key, "new", 0, winreg.REG_SZ, "temporary")
+                during.append((json.loads(marker.read_bytes()), json.loads(snapshot.read_bytes()), setting))
+            except Exception as exc:
+                during.append(exc)
+                return 1
+            return int(callback_error)
+
+        response = json.loads(registry_probe(root.value, str(config), str(project), edit))
+        assert len(during) == 1 and isinstance(during[0], tuple), (during, response)
+        incomplete, before, temporary_value = during[0]
+        assert incomplete["snapshot"] == snapshot.name
+        assert before["existed"] is exists
+        assert temporary_value == (str(project), winreg.REG_SZ)
+        assert json.loads(snapshot.read_bytes()) == before
+        assert not marker.exists()
+        transaction = response["registry_transaction"]
+        assert Path(transaction["snapshot_path"]) == snapshot
+        assert Path(transaction["marker_path"]) == marker
+        assert transaction["verified"] is True
+        if callback_error:
+            assert "simulated editor failure" in response["error"]
+        else:
+            assert "error" not in response
+        with winreg.OpenKey(root.value, "Sibling") as key:
+            assert winreg.QueryValueEx(key, "") == ("preserved", winreg.REG_SZ)
+        if exists:
+            with winreg.OpenKey(root.value, nested) as key:
+                assert winreg.QueryValueEx(key, "") == (blob, winreg.REG_BINARY)
+                assert winreg.QueryValueEx(key, "多") == (0xDEADBEEF, winreg.REG_DWORD)
+            with winreg.OpenKey(root.value, key_name) as key:
+                assert winreg.QueryValueEx(key, "DIR_SERUM") == (b"before", winreg.REG_BINARY)
+                assert winreg.QueryInfoKey(key)[:2] == (2, 1)
+            with winreg.OpenKey(root.value, key_name + r"\Empty") as key:
+                assert winreg.QueryInfoKey(key)[:2] == (0, 0)
+            assert before["keys"][r"Nested\空"][""] == {"type": winreg.REG_BINARY, "hex": blob.hex()}
+        else:
+            with pytest.raises(FileNotFoundError):
+                winreg.OpenKey(root.value, key_name)
+    finally:
+        assert api.RegCloseKey(root) == 0
+
+
+def test_registry_artifact_collision_preserves_original(registry_probe, tmp_path):
+    import winreg
+
+    root = ctypes.c_void_p()
+    api = ctypes.windll.advapi32
+    assert api.RegLoadAppKeyW(str(tmp_path / "fixture.hiv"), ctypes.byref(root),
+                              winreg.KEY_ALL_ACCESS, 1, 0) == 0
+    snapshot = tmp_path / "registry-snapshot.json"
+    snapshot.write_bytes(b"earlier run")
+    called = []
+    callback = ctypes.CFUNCTYPE(ctypes.c_int)(lambda: called.append(True) or 0)
+    try:
+        evidence = json.loads(registry_probe(root.value, str(tmp_path), str(tmp_path / "project"), callback))
+        assert "create registry artifact" in evidence["error"]
+        assert evidence["registry_transaction"]["verified"] is False
+        assert not called
+        assert snapshot.read_bytes() == b"earlier run"
+        assert not (tmp_path / "registry-incomplete.json").exists()
+        with pytest.raises(FileNotFoundError):
+            winreg.OpenKey(root.value, "ColorizingDMD")
+    finally:
+        assert api.RegCloseKey(root) == 0
 
 
 @pytest.fixture(scope="module")
@@ -380,6 +538,17 @@ def test_bridge_timeout_retains_diagnostics(requested_project, monkeypatch, tmp_
     config = tmp_path / "project-editor-config"
     assert (config / "bridge.stdout").read_bytes() == b"started"
     assert (config / "bridge.stderr").read_bytes() == b"partial"
+
+
+def test_bridge_error_exposes_registry_observations(requested_project, monkeypatch):
+    diagnostics = {"registry_transaction": {"verified": False}, "editor_launched": False}
+    response = {"schema_version": 1, "status": "error", "stage": "registry-restore",
+                "message": "could not verify", "diagnostics": diagnostics}
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(
+        a, 1, json.dumps(response).encode(), b""))
+    with pytest.raises(EditorBridgeError, match="registry-restore") as failure:
+        requested_project()
+    assert failure.value.diagnostics == diagnostics
 
 
 def test_native_preflight_reports_missing_startup_texture(installed_artifacts, case, profile, tmp_path):
