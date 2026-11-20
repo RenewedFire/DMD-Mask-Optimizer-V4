@@ -6,6 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from jsonschema import Draft202012Validator, ValidationError
 
 from dmd_optimizer.adapters.editor import (
     EditorBridgeError,
@@ -18,6 +19,79 @@ from scripts.lock_profile import Profile, RomMember, _read_profile
 
 
 PINNED_DECODER = "da71fa73e838ab3e257a2a73c8f74d88a3336615930761fa494a251822e0c2d5"
+
+
+@pytest.fixture(scope="module")
+def bridge_schema():
+    path = Path(__file__).resolve().parents[2] / "schemas" / "editor-bridge-v1.json"
+    schema = json.loads(path.read_text(encoding="utf-8"))
+    Draft202012Validator.check_schema(schema)
+    return Draft202012Validator(schema)
+
+
+@pytest.fixture
+def bridge_request(tmp_path):
+    return {
+        "schema_version": 1,
+        "editor_root": str(tmp_path / "stage"),
+        "expected_decoder_sha256": PINNED_DECODER,
+        "project_root": str(tmp_path / "project"),
+        "config_root": str(tmp_path / "config"),
+        "deadline_ms": 1500,
+        "width": 1,
+        "height": 1,
+        "native_shades": 4,
+        "references": [{
+            "id": "A",
+            "native_pixels": [0],
+            "source_sha256": hashlib.sha256(b"\x00").hexdigest(),
+            "ignore_bitmap": [1],
+            "ignore_sha256": hashlib.sha256(b"\x01").hexdigest(),
+            "shape": False,
+        }],
+    }
+
+
+def test_schema_accepts_masked_and_unmasked_requests(bridge_schema, bridge_request):
+    masked = bridge_request["references"][0]
+    bridge_request["references"].append({
+        **masked, "id": "B", "ignore_bitmap": None, "ignore_sha256": None,
+    })
+
+    bridge_schema.validate(bridge_request)
+
+
+@pytest.mark.parametrize("missing", ["ignore_bitmap", "ignore_sha256"])
+def test_schema_rejects_unpaired_mask_fields(bridge_schema, bridge_request, missing):
+    bridge_request["references"][0][missing] = None
+
+    with pytest.raises(ValidationError):
+        bridge_schema.validate(bridge_request)
+
+
+def test_schema_accepts_success_and_error_responses(bridge_schema):
+    digest = hashlib.sha256(b"\x00").hexdigest()
+    bridge_schema.validate({
+        "schema_version": 1,
+        "status": "ok",
+        "files": [{"path": "project.cRZ", "sha256": digest, "size": 1, "header": {}}],
+        "references": [{
+            "id": "A", "ordinal": 0, "native_pixels": [0], "source_sha256": digest,
+            "ignore_sha256": None, "shape": False, "slot": 255,
+        }],
+        "custom_mask_count": 0,
+        "unmasked_sentinel": 255,
+        "sidecar_path": None,
+        "runtime_export": None,
+        "observations": {},
+    })
+    bridge_schema.validate({
+        "schema_version": 1,
+        "status": "error",
+        "stage": "save",
+        "message": "Project save failed",
+        "diagnostics": {},
+    })
 
 
 @pytest.fixture
@@ -158,6 +232,22 @@ def test_request_rejects_paths_inside_staged_editor(case, profile, tmp_path, whi
         serialize_request(project, case, profile, editor_root=staged, config_root=config)
 
 
+@pytest.mark.parametrize(
+    "relative_root", [".", "child", ".."], ids=["installation", "descendant", "ancestor"],
+)
+def test_request_rejects_editor_root_overlapping_installation(
+    case, profile, tmp_path, relative_root,
+):
+    installation = tmp_path / "installed" / "ColorizingDMD"
+    editor_root = (installation / relative_root).resolve()
+    installation.mkdir(parents=True)
+    editor_root.mkdir(parents=True, exist_ok=True)
+    profile.components["ColorizingDMD editor"]["provenance"]["installation_path"] = str(installation)
+
+    with pytest.raises(EditorBridgeError, match="staged editor root.*editor installation"):
+        serialize_request(tmp_path / "project", case, profile, editor_root=editor_root)
+
+
 @pytest.fixture
 def installed_artifacts():
     source_root = os.environ.get("DMD_EDITOR_SOURCE_ROOT")
@@ -209,7 +299,7 @@ def test_stage_rejects_decoder_substitution(installed_artifacts, profile, tmp_pa
 
 
 def test_serialized_request_preserves_order_pixels_and_masks(
-    installed_artifacts, case, profile, tmp_path,
+    installed_artifacts, case, profile, tmp_path, bridge_schema,
 ):
     source, decoder = installed_artifacts
     staged = stage_editor(source, tmp_path / "stage", profile, decoder_path=decoder)
@@ -219,6 +309,7 @@ def test_serialized_request_preserves_order_pixels_and_masks(
         project, case, profile, editor_root=staged, config_root=config, deadline_ms=1500,
     ))
 
+    bridge_schema.validate(request)
     assert request["schema_version"] == 1
     assert request["expected_decoder_sha256"] == PINNED_DECODER
     assert Path(request["editor_root"]) == staged

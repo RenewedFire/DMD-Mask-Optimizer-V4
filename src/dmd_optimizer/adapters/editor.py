@@ -186,6 +186,8 @@ def serialize_request(
         else (project.parent / f"{project.name}-editor-config").resolve()
     )
     installation = _installation(profile)
+    if _overlaps(editor, installation):
+        raise EditorBridgeError("staged editor root must be outside the editor installation")
     if any(_overlaps(output, protected) for output in (project, config) for protected in (editor, installation)):
         raise EditorBridgeError("project and config roots must be outside the staged editor and editor installation")
     if _overlaps(project, config):

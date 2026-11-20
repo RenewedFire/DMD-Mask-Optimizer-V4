@@ -29,7 +29,10 @@
         "ignore_bitmap": { "oneOf": [{ "$ref": "#/$defs/ignoreBitmap" }, { "type": "null" }] },
         "ignore_sha256": { "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
         "shape": { "const": false }
-      }
+      },
+      "if": { "properties": { "ignore_bitmap": { "type": "null" } } },
+      "then": { "properties": { "ignore_sha256": { "type": "null" } } },
+      "else": { "properties": { "ignore_sha256": { "type": "string" } } }
     },
     "request": {
       "type": "object",
