@@ -6,6 +6,7 @@ import shutil
 import struct
 import subprocess
 import tempfile
+import uuid
 from dataclasses import replace
 from pathlib import Path
 
@@ -35,8 +36,33 @@ def registry_probe(tmp_path_factory):
     source = build / "probe.cpp"
     source.write_text(f'#define DMD_REPOSITORY_ROOT LR"({build})"\n' + r'''
 #include <windows.h>
+#include <tlhelp32.h>
 #include <cstdio>
 #include <string_view>
+bool late_editor{}, deny_accounting{}, stuck_job{}, delayed_signal{};
+unsigned scans{};
+BOOL WINAPI probe_first(HANDLE snapshot, LPPROCESSENTRY32W process) {
+    auto ok = Process32FirstW(snapshot, process);
+    if (ok && late_editor && ++scans == 2) wcscpy_s(process->szExeFile, L"ColorizingDMD.exe");
+    return ok;
+}
+BOOL WINAPI probe_query_job(HANDLE job, JOBOBJECTINFOCLASS type, LPVOID data, DWORD size, LPDWORD used) {
+    if (deny_accounting && type == JobObjectBasicAccountingInformation) {
+        SetLastError(ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
+    auto ok = QueryInformationJobObject(job, type, data, size, used);
+    if (ok && stuck_job && type == JobObjectBasicAccountingInformation)
+        static_cast<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION*>(data)->ActiveProcesses = 1;
+    return ok;
+}
+#define Process32FirstW probe_first
+#define QueryInformationJobObject probe_query_job
+DWORD WINAPI probe_wait(HANDLE object, DWORD timeout) {
+    if (delayed_signal && timeout == 0) return WAIT_TIMEOUT;
+    return WaitForSingleObject(object, timeout);
+}
+#define WaitForSingleObject probe_wait
 // Simulate a counted Win32 enumeration result that cannot be reopened
 // through a null-terminated name. All actual registry I/O stays in the app hive.
 void simulate_counted_name(LSTATUS status, wchar_t* name, DWORD length) {
@@ -80,6 +106,57 @@ BOOL WINAPI probe_write(HANDLE file, LPCVOID buffer, DWORD size, LPDWORD count, 
 #include "editor_bridge.cpp"
 #undef main
 int wmain(int argc, wchar_t** argv) {
+    if (argc == 2 && std::wstring_view(argv[1]) == L"--descendant") { Sleep(30000); return 0; }
+    if (fs::path(argv[0]).filename() == L"ColorizingDMD.exe") {
+        STARTUPINFOW startup{sizeof(startup)};
+        PROCESS_INFORMATION child{};
+        wchar_t args[] = L"worker --descendant";
+        check_bool(CreateProcessW(argv[0], args, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startup, &child));
+        std::ofstream("descendant.txt") << child.dwProcessId;
+        CloseHandle(child.hProcess); CloseHandle(child.hThread);
+        return 0;
+    }
+    if (argc == 3 && std::wstring_view(argv[1]) == L"--job-test") {
+        init_apartment(apartment_type::multi_threaded);
+        auto root = fs::current_path();
+        if (file_hash(root / L"ColorizingDMD.exe") != file_hash(fs::canonical(argv[0]))) return 2;
+        HKEY hive{};
+        check_registry(RegLoadAppKeyW((root / L"fixture.hiv").c_str(), &hive, KEY_ALL_ACCESS,
+            REG_PROCESS_APPKEY, 0), "open private test hive");
+        deny_accounting = std::wstring_view(argv[2]) == L"accounting-failure";
+        stuck_job = std::wstring_view(argv[2]) == L"timeout";
+        delayed_signal = std::wstring_view(argv[2]) == L"delayed-signal";
+        JsonObject evidence;
+        try {
+            with_journaled_transaction(hive, root / L"journal", {{L"DIR_SERUM", L"temporary"}}, evidence,
+                [&](std::wstring const& run) { bounded_startup(root, 4000, evidence, run); });
+        } catch (std::exception const& error) {
+            evidence.Insert(L"error", JsonValue::CreateStringValue(to_hstring(error.what())));
+        }
+        std::cout << to_string(evidence.Stringify());
+        RegCloseKey(hive);
+        return 0;
+    }
+    if (argc == 3 && std::wstring_view(argv[1]) == L"--recover-invalid") {
+        init_apartment(apartment_type::multi_threaded);
+        fs::path root(argv[2]);
+        HKEY hive{};
+        check_registry(RegLoadAppKeyW((root / L"recover.hiv").c_str(), &hive, KEY_ALL_ACCESS,
+            REG_PROCESS_APPKEY, 0), "open private recovery hive");
+        JsonObject evidence;
+        hstring stage;
+        evidence.Insert(L"editor_launched", JsonValue::CreateBooleanValue(false));
+        return with_editor_isolation(root / L"journal", nullptr, [&] { return hive; }, evidence, [&] {
+            return preflight(JsonObject::Parse(to_hstring(read_request())), evidence, true,
+                root / L"journal", []() -> HKEY { throw std::runtime_error("unexpected fresh transaction"); }, stage);
+        });
+    }
+    if (argc == 2 && std::wstring_view(argv[1]) == L"--late-editor") {
+        late_editor = true;
+        char flag[] = "--startup-preflight";
+        char* args[]{nullptr, flag};
+        return editor_bridge_main(2, args);
+    }
     if (argc == 1) return editor_bridge_main(1, nullptr);
     if (argc == 2 && std::wstring_view(argv[1]) == L"--startup-preflight") {
         char flag[] = "--startup-preflight";
@@ -94,7 +171,7 @@ int wmain(int argc, wchar_t** argv) {
         REG_PROCESS_APPKEY, 0), "open private test hive");
     interrupt_marker_write = true;
     with_journaled_transaction(hive, root / L"journal", {{L"DIR_SERUM", L"temporary"}},
-        JsonObject{}, [] { ExitProcess(79); });
+        JsonObject{}, [](auto const&) { ExitProcess(79); });
     return 3;
 }
 using Probe = int(__cdecl*)();
@@ -106,7 +183,7 @@ extern "C" __declspec(dllexport) const char* gate(
     try {
         with_editor_isolation(journal, lock, [&] { return software; }, observations, [&] {
             with_journaled_transaction(software, journal, {{L"DIR_SERUM", L"temporary"}},
-                observations, [&] { during(); });
+                observations, [&](auto const&) { during(); });
             return 0;
         });
     } catch (hresult_error const& error) {
@@ -197,7 +274,7 @@ def test_bridge_entry_checks_only_its_dedicated_journal(registry_probe, interrup
         result = subprocess.run([str(executable)], input=b"{}", capture_output=True, cwd=tmp_path)
         response = json.loads(result.stdout)
         assert result.returncode == 1 and response["stage"] == "registry-isolation", response
-        assert b"private probe denied HKCU open" in result.stderr
+        assert b"private probe denied HKCU open" in result.stderr, response["message"]
         assert "open current user SOFTWARE for editor recovery" in response["message"]
         assert response["diagnostics"]["editor_launched"] is False
         assert marker.read_bytes() == original
@@ -211,7 +288,7 @@ def interrupted_editor(registry_probe, tmp_path):
 
     journal = tmp_path / "journal"
     journal.mkdir()
-    run = journal / "previous"
+    run = journal / uuid.uuid4().hex[:12]
     run.mkdir()
     snapshot = run / "registry-snapshot.json"
     snapshot.write_text(json.dumps({"schema_version": 1, "existed": True, "root_name": "ColorizingDMD",
@@ -259,6 +336,27 @@ def test_interrupted_registry_restored_before_new_transaction(interrupted_editor
     with winreg.OpenKey(hive, r"ColorizingDMD\Nested") as key:
         assert winreg.QueryValueEx(key, "raw") == (b"\x00\xff", winreg.REG_BINARY)
     assert invoke()["registry_recovery"]["restored"] is False
+
+
+def test_interrupted_job_with_live_descendant_defers_recovery(interrupted_editor, registry_probe):
+    invoke, _, marker, snapshot, called, _ = interrupted_editor
+    api = ctypes.windll.kernel32
+    api.CreateJobObjectW.restype = ctypes.c_void_p
+    job = ctypes.c_void_p(api.CreateJobObjectW(None, "Global\\DMDMaskOptimizer-EditorJob-" + snapshot.parent.name))
+    assert job.value
+    try:
+        with subprocess.Popen([registry_probe.executable, "--descendant"]) as child:
+            try:
+                assert api.AssignProcessToJobObject(job, ctypes.c_void_p(int(child._handle)))
+                evidence = invoke()
+                assert "active processes" in evidence.get("error", ""), evidence
+                assert not called and marker.is_file()
+            finally:
+                child.terminate()
+                child.wait(timeout=5)
+        assert invoke()["registry_recovery"]["restored"] and not marker.exists()
+    finally:
+        assert api.CloseHandle(job)
 
 
 def test_interrupted_marker_write_leaves_no_recovery_or_registry_changes(registry_probe, tmp_path):
@@ -906,6 +1004,98 @@ def test_profile_declares_required_startup_texture(locked_profile):
     assert Path(editor["startup_asset_source"]) == Path(r"C:\DMD Colorization\ColorizingDMD")
 
 
+@pytest.mark.parametrize("mode", ["success", "accounting-failure", "timeout", "delayed-signal"])
+def test_job_must_be_confirmed_empty_before_registry_restore(registry_probe, tmp_path, mode):
+    import winreg
+
+    shutil.copyfile(registry_probe.executable, tmp_path / "ColorizingDMD.exe")
+    completed = subprocess.run([registry_probe.executable, "--job-test", mode], cwd=tmp_path,
+                               capture_output=True, timeout=45, check=True)
+    evidence = json.loads(completed.stdout)
+    assert int((tmp_path / "descendant.txt").read_text()) > 0
+    transaction = evidence["registry_transaction"]
+    marker = Path(transaction["marker_path"])
+    confirmed = mode in {"success", "delayed-signal"}
+    assert transaction["verified"] is confirmed, evidence
+    if confirmed:
+        assert evidence["job_active_processes"] == 0
+        assert evidence["job_total_processes"] == 2
+        assert evidence["editor_exited"] and not marker.exists()
+    else:
+        assert "error" in evidence and marker.is_file()
+        if mode == "timeout":
+            assert "timed out" in evidence["error"]
+        hive = ctypes.c_void_p()
+        api = ctypes.windll.advapi32
+        assert api.RegLoadAppKeyW(str(tmp_path / "fixture.hiv"), ctypes.byref(hive),
+                                  winreg.KEY_READ, 1, 0) == 0
+        try:
+            with winreg.OpenKey(hive.value, "ColorizingDMD") as key:
+                assert winreg.QueryValueEx(key, "DIR_SERUM")[0] == "temporary"
+        finally:
+            assert api.RegCloseKey(hive) == 0
+
+
+def test_late_editor_blocks_fresh_transaction(installed_artifacts, case, profile, registry_probe, tmp_path):
+    source, decoder = installed_artifacts
+    stage = stage_editor(source, tmp_path / "stage", profile, decoder_path=decoder)
+    config = tmp_path / "config"
+    config.mkdir()
+    request = serialize_request(tmp_path / "project", case, profile, editor_root=stage, config_root=config)
+    completed = subprocess.run([registry_probe.executable, "--late-editor"],
+                               input=request.encode(), capture_output=True, timeout=30)
+    response = json.loads(completed.stdout)
+    assert "already running" in response["message"], response
+    assert b"private probe denied HKCU open" not in completed.stderr
+    assert "registry_transaction" not in response["diagnostics"]
+    assert not response["diagnostics"]["editor_launched"]
+
+
+def test_pending_recovery_precedes_invalid_texture(installed_artifacts, case, profile, registry_probe,
+                                                  interrupted_editor, tmp_path):
+    import winreg
+
+    _, _, marker, snapshot, _, _ = interrupted_editor
+    source, decoder = installed_artifacts
+    stage = stage_editor(source, tmp_path / "stage", profile, decoder_path=decoder)
+    request = serialize_request(tmp_path / "project", case, profile, editor_root=stage)
+    (stage / TEXTURE).unlink()
+    completed = subprocess.run([registry_probe.executable, "--recover-invalid", str(tmp_path)],
+                               input=request.encode(), capture_output=True, timeout=30)
+    response = json.loads(completed.stdout)
+    assert response["stage"] == "startup-assets"
+    diagnostics = response["diagnostics"]
+    assert diagnostics["registry_recovery"]["restored"]
+    assert not diagnostics["editor_launched"] and "registry_transaction" not in diagnostics
+    assert set(marker.parent.iterdir()) == {snapshot.parent}
+    hive = ctypes.c_void_p()
+    api = ctypes.windll.advapi32
+    assert api.RegLoadAppKeyW(str(tmp_path / "recover.hiv"), ctypes.byref(hive), winreg.KEY_READ, 1, 0) == 0
+    try:
+        with winreg.OpenKey(hive.value, r"ColorizingDMD\Nested") as key:
+            assert winreg.QueryValueEx(key, "raw") == (b"\x00\xff", winreg.REG_BINARY)
+    finally:
+        assert api.RegCloseKey(hive) == 0
+
+
+@pytest.mark.parametrize("path", [r"C:\vPinball\ColorizingDMD", r"C:\DMD Colorization\ColorizingDMD"])
+def test_adapter_protects_fixed_installations_with_custom_profile(path, tmp_path, case, profile):
+    target = Path(path) / "Projects"
+    profile.components["ColorizingDMD editor"]["startup_asset_source"] = str(tmp_path / "other")
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    with pytest.raises(EditorBridgeError, match="outside the editor source"):
+        stage_editor(tmp_path / "absent-source", target, profile)
+    with pytest.raises(EditorBridgeError, match="roots must be outside"):
+        serialize_request(target, case, profile, editor_root=stage)
+
+
+def test_stage_requires_fixed_texture_source(profile, tmp_path):
+    profile.components["ColorizingDMD editor"]["startup_asset_source"] = str(tmp_path / "other")
+    with pytest.raises(EditorBridgeError, match="startup asset source"):
+        stage_editor(tmp_path / "absent-source", tmp_path / "stage", profile)
+
+
 def test_valid_stage_requires_explicit_startup_before_registry_access(
     installed_artifacts, case, profile, tmp_path, registry_probe, monkeypatch,
 ):
@@ -940,7 +1130,7 @@ def test_real_startup_preflight(installed_artifacts, locked_profile, case):
     artifacts.mkdir(exist_ok=True)
     run = Path(tempfile.mkdtemp(prefix="startup-preflight-", dir=artifacts))
     stage = stage_editor(source, run / "editor", locked_profile, decoder_path=decoder)
-    with pytest.raises(EditorBridgeError) as failure:
+    with pytest.raises(EditorBridgeError, match=r"editor bridge startup-observation \(exit code 1\)") as failure:
         write_project(run / "project", case, locked_profile, editor_root=stage, deadline_ms=25000,
                       startup_preflight=True)
     diagnostics = failure.value.diagnostics
@@ -948,6 +1138,11 @@ def test_real_startup_preflight(installed_artifacts, locked_profile, case):
     transaction = diagnostics["registry_transaction"]
     assert transaction["verified"] and not Path(transaction["marker_path"]).exists()
     assert diagnostics["editor_launched"] and diagnostics["editor_exited"], (run, diagnostics)
+    assert diagnostics["running_at_deadline"] and diagnostics["observation_ms"] == 5000
+    titles = diagnostics["visible_window_titles"]
+    assert any(title == "ColorizingDMD" or title.startswith("ColorizingDMD v3.17.1 ") for title in titles), (run, titles)
+    assert {"Backgrounds", "Sprites", "Images"}.issubset(titles), (run, titles)
+    assert diagnostics["job_active_processes"] == 0
     assert diagnostics["decoder_sha256"] == PINNED_DECODER
 
 

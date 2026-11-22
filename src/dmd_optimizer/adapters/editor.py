@@ -10,12 +10,16 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from scripts.lock_profile import Profile, ProfileError, _toolchain_path, _verify_asset, _verify_binary
+from scripts.lock_profile import (
+    STARTUP_ASSET_SOURCE, Profile, ProfileError, _toolchain_path, _verify_asset, _verify_binary,
+)
 
 
 _DECODER_SHA256 = "da71fa73e838ab3e257a2a73c8f74d88a3336615930761fa494a251822e0c2d5"
 _EDITOR = "ColorizingDMD editor"
 _DECODER = "bundled decoder"
+_TEXTURE_INSTALLATION = Path(STARTUP_ASSET_SOURCE)
+_EDITOR_INSTALLATION = Path(r"C:\vPinball\ColorizingDMD")
 
 
 class EditorBridgeError(RuntimeError):
@@ -79,8 +83,16 @@ def _overlaps(first: Path, second: Path) -> bool:
     return first.is_relative_to(second) or second.is_relative_to(first)
 
 
-def _installation(profile: Profile) -> Path:
-    return Path(profile.components[_EDITOR]["provenance"]["installation_path"]).resolve()
+def _installations(profile: Profile) -> tuple[Path, ...]:
+    editor = profile.components[_EDITOR]
+    return (_EDITOR_INSTALLATION.resolve(), _TEXTURE_INSTALLATION.resolve(),
+            Path(editor["provenance"]["installation_path"]).resolve())
+
+
+def _check_asset_source(profile: Profile) -> None:
+    declared = Path(profile.components[_EDITOR]["startup_asset_source"])
+    if declared != _TEXTURE_INSTALLATION or _TEXTURE_INSTALLATION.resolve() != _TEXTURE_INSTALLATION.absolute():
+        raise EditorBridgeError(f"startup asset source must be {_TEXTURE_INSTALLATION}")
 
 
 def _verify_staged_file(path: Path, lock: dict, name: str) -> None:
@@ -107,9 +119,10 @@ def stage_editor(
     """
     source = source_root.resolve()
     target = destination.resolve()
-    asset_source = Path(profile.components[_EDITOR]["startup_asset_source"]).resolve()
-    if any(_overlaps(target, protected) for protected in (source, asset_source, _installation(profile))):
+    installations = _installations(profile)
+    if any(_overlaps(target, protected) for protected in (source, *installations)):
         raise EditorBridgeError("staging destination must be outside the editor source and installation")
+    _check_asset_source(profile)
     if target.exists():
         raise EditorBridgeError(f"staging destination already exists: {target}")
     if not source.is_dir():
@@ -124,11 +137,11 @@ def stage_editor(
             for relative, lock, name in files:
                 origin = decoder_path if name == _DECODER and decoder_path is not None else source / relative
                 if name == _DECODER and origin.resolve() in {
-                    protected / relative for protected in (_installation(profile), asset_source)
+                    protected / relative for protected in installations
                 }:
                     raise EditorBridgeError("bundled decoder must come from the separate source-tree lock")
                 if "size" in lock:
-                    origin = asset_source / relative
+                    origin = _TEXTURE_INSTALLATION.resolve() / relative
                     if origin.resolve() != origin:
                         raise EditorBridgeError(f"{name}: source file is redirected: {origin}")
                 copied = staging / relative
@@ -205,7 +218,7 @@ def serialize_request(
         if config_root is not None
         else (project.parent / f"{project.name}-editor-config").resolve()
     )
-    installations = (_installation(profile), Path(profile.components[_EDITOR]["startup_asset_source"]).resolve())
+    installations = _installations(profile)
     if any(_overlaps(editor, installation) for installation in installations):
         raise EditorBridgeError("staged editor root must be outside the editor installation")
     if any(_overlaps(output, protected) for output in (project, config) for protected in (editor, *installations)):
@@ -213,6 +226,7 @@ def serialize_request(
     if _overlaps(project, config):
         raise EditorBridgeError("project and config roots must be separate")
 
+    _check_asset_source(profile)
     for relative, lock, name in _editor_files(profile):
         _verify_staged_file(editor / relative, lock, name)
     return json.dumps({

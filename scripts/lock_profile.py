@@ -12,6 +12,7 @@ from pathlib import Path
 
 
 PROFILE_PATH = Path(__file__).resolve().parents[1] / "profiles" / "twst_405.json"
+STARTUP_ASSET_SOURCE = r"C:\DMD Colorization\ColorizingDMD"
 PE_ARCHITECTURES = {0x014C: "x86", 0x8664: "x64", 0xAA64: "arm64"}
 REQUIRED_COMPONENTS = ("ColorizingDMD editor", "bundled decoder", "PinMAME 3.6", "local Serum runtime")
 
@@ -150,7 +151,9 @@ def _validate_component(name, record):
         raise ProfileError(f"{name}: invalid component record; expected an object")
     _field(record, "binary", _toolchain_path, "a relative toolchain path", name)
     if name == "ColorizingDMD editor":
-        _field(record, "startup_asset_source", _windows_absolute_path, "an absolute Windows path", name)
+        _field(record, "startup_asset_source",
+               lambda value: isinstance(value, str) and value.casefold() == STARTUP_ASSET_SOURCE.casefold(),
+               STARTUP_ASSET_SOURCE, name)
         assets = _field(record, "startup_assets", lambda value: isinstance(value, dict)
                         and "textures/chiffres.raw" in value, "the required editor startup asset locks", name)
         for path, lock in assets.items():

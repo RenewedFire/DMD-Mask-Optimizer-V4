@@ -170,6 +170,7 @@ def test_rejects_empty_component_record(case):
     ('dependencies', {}),
     ('pending', 'not a list'), ('release_archive_sha256', None), ('sha256', None), ('sha256', 'a' * 63),
     ('source_commit', '3721691'), ('source_commit', 'g' * 40),
+    ('startup_asset_source', r'C:\Other\ColorizingDMD'),
 ])
 def test_names_invalid_native_fields(case, field, value):
     _, _, _, profile, save_profile = case

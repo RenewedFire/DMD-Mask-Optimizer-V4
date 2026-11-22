@@ -359,6 +359,21 @@ void validate_journal(fs::path const& journal) {
             throw std::runtime_error("registry journal overlaps an editor installation");
 }
 
+std::wstring editor_job_name(std::wstring_view run) {
+    return std::wstring(L"Global\\DMDMaskOptimizer-EditorJob-").append(run);
+}
+
+struct JobExitUnconfirmed : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+JOBOBJECT_BASIC_ACCOUNTING_INFORMATION job_accounting(HANDLE job) {
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION info{};
+    if (!QueryInformationJobObject(job, JobObjectBasicAccountingInformation, &info, sizeof(info), nullptr))
+        throw JobExitUnconfirmed("cannot confirm editor job process count");
+    return info;
+}
+
 int with_editor_isolation(fs::path const& journal, wchar_t const* lock,
     std::function<HKEY()> const& software, JsonObject const& diagnostics, std::function<int()> const& run) {
     // Object lifetime, including kernel cleanup on process termination, owns the lock.
@@ -389,6 +404,18 @@ int with_editor_isolation(fs::path const& journal, wchar_t const* lock,
         evidence.Insert(L"snapshot_path", JsonValue::CreateStringValue(snapshot.native()));
         auto digest = record.GetNamedString(L"sha256");
         auto before = parse_snapshot(read_journal_json(snapshot, &digest));
+        // A previous bridge can die while its kill-on-close job is draining.
+        // A differently named descendant would be absent from the editor scan.
+        handle prior_job(OpenJobObjectW(JOB_OBJECT_QUERY, FALSE, editor_job_name(run_id).c_str()));
+        if (prior_job) {
+            if (job_accounting(prior_job.get()).ActiveProcesses)
+                throw JobExitUnconfirmed("interrupted editor job still has active processes");
+        } else if (GetLastError() != ERROR_FILE_NOT_FOUND) {
+            throw JobExitUnconfirmed("cannot inspect interrupted editor job");
+        }
+        require_editor_stopped();
+        // Recovery of an already published marker precedes request validation.
+        // It may restore the old snapshot, never prepare a new transaction.
         finish_restoration(software(), before, marker);
         evidence.SetNamedValue(L"restored", JsonValue::CreateBooleanValue(true));
     }
@@ -445,6 +472,10 @@ void with_registry_transaction(HKEY software, fs::path const& run_root, fs::path
             }
         }
         run();
+    } catch (JobExitUnconfirmed const&) {
+        // Leave both the durable marker and temporary settings intact until
+        // recovery can establish that no member of the editor job remains.
+        throw;
     } catch (...) {
         operation_error = std::current_exception();
     }
@@ -455,13 +486,13 @@ void with_registry_transaction(HKEY software, fs::path const& run_root, fs::path
 
 void with_journaled_transaction(HKEY software, fs::path const& journal,
     std::map<std::wstring, std::wstring> const& temporary_paths, JsonObject const& observations,
-    std::function<void()> const& run) {
+    std::function<void(std::wstring const&)> const& run) {
     validate_journal(journal);
     fs::create_directories(journal);
-    auto id = CryptographicBuffer::EncodeToHexString(CryptographicBuffer::GenerateRandom(16));
-    auto dir = journal / id.c_str();
+    std::wstring id(CryptographicBuffer::EncodeToHexString(CryptographicBuffer::GenerateRandom(16)));
+    auto dir = journal / id;
     if (!fs::create_directory(dir)) throw std::runtime_error("registry journal run already exists");
-    with_registry_transaction(software, journal, dir, temporary_paths, observations, run, journal);
+    with_registry_transaction(software, journal, dir, temporary_paths, observations, [&] { run(id); }, journal);
 }
 
 int failure(hstring const& stage, hstring const& message, JsonObject const& diagnostics) {
@@ -515,9 +546,12 @@ BOOL CALLBACK observe_window(HWND window, LPARAM context) {
     return TRUE;
 }
 
-void bounded_startup(fs::path const& editor, DWORD duration, JsonObject const& diagnostics) {
-    handle job(CreateJobObjectW(nullptr, nullptr));
+void bounded_startup(fs::path const& editor, DWORD duration, JsonObject const& diagnostics, std::wstring const& run) {
+    auto job_name = editor_job_name(run);
+    handle job(CreateJobObjectW(nullptr, job_name.c_str()));
+    auto status = GetLastError();
     check_bool(bool(job));
+    if (status == ERROR_ALREADY_EXISTS) throw std::runtime_error("editor job already exists");
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     check_bool(SetInformationJobObject(job.get(), JobObjectExtendedLimitInformation, &limits, sizeof(limits)));
@@ -541,15 +575,8 @@ void bounded_startup(fs::path const& editor, DWORD duration, JsonObject const& d
     check_bool(CreateProcessW((editor / L"ColorizingDMD.exe").c_str(), nullptr, nullptr, nullptr, FALSE,
         EXTENDED_STARTUPINFO_PRESENT, nullptr, editor.c_str(), &startup.StartupInfo, &child));
     handle process(child.hProcess), thread(child.hThread);
-    // Finish termination before the registry transaction can restore its snapshot,
-    // including when gathering observations throws.
-    struct StopEditor {
-        handle& job;
-        HANDLE process;
-        ~StopEditor() { job.close(); WaitForSingleObject(process, INFINITE); }
-    };
-    {
-        StopEditor stop{job, process.get()};
+    std::exception_ptr observation_error;
+    try {
         diagnostics.SetNamedValue(L"editor_launched", JsonValue::CreateBooleanValue(true));
         diagnostics.Insert(L"editor_pid", JsonValue::CreateNumberValue(child.dwProcessId));
         diagnostics.Insert(L"observation_ms", JsonValue::CreateNumberValue(duration));
@@ -557,15 +584,36 @@ void bounded_startup(fs::path const& editor, DWORD duration, JsonObject const& d
         if (wait != WAIT_OBJECT_0 && wait != WAIT_TIMEOUT) throw_last_error();
         diagnostics.Insert(L"running_at_deadline", JsonValue::CreateBooleanValue(wait == WAIT_TIMEOUT));
         WindowObservation observation{child.dwProcessId, {}};
-        EnumWindows(observe_window, reinterpret_cast<LPARAM>(&observation));
+        check_bool(EnumWindows(observe_window, reinterpret_cast<LPARAM>(&observation)));
         JsonArray titles;
         for (auto const& title : observation.titles) titles.Append(JsonValue::CreateStringValue(title));
         diagnostics.Insert(L"visible_window_titles", titles);
+    } catch (...) {
+        observation_error = std::current_exception();
     }
+    // A signaled main process says nothing about descendants. Keep the job
+    // handle until all members have exited, including on observation errors.
+    if (!TerminateJobObject(job.get(), ERROR_PROCESS_ABORTED))
+        throw JobExitUnconfirmed("cannot terminate editor job");
+    auto deadline = GetTickCount64() + 5000;
+    auto info = job_accounting(job.get());
+    while (info.ActiveProcesses) {
+        if (GetTickCount64() >= deadline) throw JobExitUnconfirmed("editor job termination timed out");
+        Sleep(10);
+        info = job_accounting(job.get());
+    }
+    // Accounting can reach zero immediately before the process handle signals.
+    auto now = GetTickCount64();
+    DWORD remaining = now < deadline ? static_cast<DWORD>(deadline - now) : 0;
+    if (WaitForSingleObject(process.get(), remaining) != WAIT_OBJECT_0)
+        throw JobExitUnconfirmed("cannot confirm main editor process exit");
+    diagnostics.Insert(L"job_active_processes", JsonValue::CreateNumberValue(info.ActiveProcesses));
+    diagnostics.Insert(L"job_total_processes", JsonValue::CreateNumberValue(info.TotalProcesses));
     DWORD exit_code{};
     check_bool(GetExitCodeProcess(process.get(), &exit_code));
     diagnostics.Insert(L"editor_exit_code", JsonValue::CreateNumberValue(exit_code));
     diagnostics.Insert(L"editor_exited", JsonValue::CreateBooleanValue(true));
+    if (observation_error) std::rethrow_exception(observation_error);
 }
 
 int preflight(JsonObject const& request, JsonObject const& diagnostics, bool launch,
@@ -628,9 +676,10 @@ int preflight(JsonObject const& request, JsonObject const& diagnostics, bool lau
     }
     auto duration = static_cast<DWORD>((std::min)(request.GetNamedNumber(L"deadline_ms"), 5000.0));
     stage = L"registry-transaction";
+    require_editor_stopped();
     with_journaled_transaction(software(), journal, {{L"DIR_SERUM", projects}, {L"DIR_DUMPS", dir},
         {L"DIR_IMAGES", dir}, {L"DIR_GIFS", dir}, {L"DIR_VP", dir}, {L"DIR_AIIMG", dir}}, diagnostics,
-        [&] { bounded_startup(editor, duration, diagnostics); });
+        [&](std::wstring const& run) { bounded_startup(editor, duration, diagnostics, run); });
     return failure(L"startup-observation", L"Bounded startup ended; see the observed process and windows", diagnostics);
 }
 
