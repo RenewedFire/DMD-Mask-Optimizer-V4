@@ -9,7 +9,9 @@
 #include <winrt/Windows.Storage.Streams.h>
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -374,6 +376,46 @@ JOBOBJECT_BASIC_ACCOUNTING_INFORMATION job_accounting(HANDLE job) {
     return info;
 }
 
+uint64_t process_creation_time(HANDLE process) {
+    FILETIME creation{}, exit{}, kernel{}, user{};
+    if (!GetProcessTimes(process, &creation, &exit, &kernel, &user))
+        throw JobExitUnconfirmed("cannot read editor job process identity");
+    return (static_cast<uint64_t>(creation.dwHighDateTime) << 32) | creation.dwLowDateTime;
+}
+
+handle open_job_process(DWORD pid) {
+    handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid));
+    if (!process && GetLastError() != ERROR_INVALID_PARAMETER)
+        throw JobExitUnconfirmed("cannot open editor job process");
+    return process;
+}
+
+bool process_exited(HANDLE process, DWORD timeout) {
+    DWORD result = WaitForSingleObject(process, timeout);
+    if (result != WAIT_OBJECT_0 && result != WAIT_TIMEOUT)
+        throw JobExitUnconfirmed("cannot confirm editor job process exit");
+    return result == WAIT_OBJECT_0;
+}
+
+void require_prior_job_exited(JsonObject const& marker) {
+    auto processes = marker.GetNamedValue(L"editor_processes", JsonValue::CreateNullValue());
+    if (processes.ValueType() != JsonValueType::Array)
+        throw JobExitUnconfirmed("interrupted editor job has no complete shutdown evidence");
+    for (auto const& entry : processes.GetArray()) {
+        auto identity = entry.GetObject();
+        double pid = identity.GetNamedNumber(L"pid");
+        auto time = to_string(identity.GetNamedString(L"creation_time"));
+        uint64_t creation{};
+        auto [end, error] = std::from_chars(time.data(), time.data() + time.size(), creation);
+        if (!std::isfinite(pid) || pid < 1 || pid > MAXDWORD || std::floor(pid) != pid ||
+            error != std::errc{} || end != time.data() + time.size() || !creation)
+            throw JobExitUnconfirmed("invalid editor job process identity");
+        auto process = open_job_process(static_cast<DWORD>(pid));
+        if (process && process_creation_time(process.get()) == creation && !process_exited(process.get(), 0))
+            throw JobExitUnconfirmed("interrupted editor job still has active processes");
+    }
+}
+
 int with_editor_isolation(fs::path const& journal, wchar_t const* lock,
     std::function<HKEY()> const& software, JsonObject const& diagnostics, std::function<int()> const& run) {
     // Object lifetime, including kernel cleanup on process termination, owns the lock.
@@ -404,15 +446,8 @@ int with_editor_isolation(fs::path const& journal, wchar_t const* lock,
         evidence.Insert(L"snapshot_path", JsonValue::CreateStringValue(snapshot.native()));
         auto digest = record.GetNamedString(L"sha256");
         auto before = parse_snapshot(read_journal_json(snapshot, &digest));
-        // A previous bridge can die while its kill-on-close job is draining.
-        // A differently named descendant would be absent from the editor scan.
-        handle prior_job(OpenJobObjectW(JOB_OBJECT_QUERY, FALSE, editor_job_name(run_id).c_str()));
-        if (prior_job) {
-            if (job_accounting(prior_job.get()).ActiveProcesses)
-                throw JobExitUnconfirmed("interrupted editor job still has active processes");
-        } else if (GetLastError() != ERROR_FILE_NOT_FOUND) {
-            throw JobExitUnconfirmed("cannot inspect interrupted editor job");
-        }
+        // Closing the last job handle can remove its name before members exit.
+        require_prior_job_exited(record);
         require_editor_stopped();
         // Recovery of an already published marker precedes request validation.
         // It may restore the old snapshot, never prepare a new transaction.
@@ -453,6 +488,7 @@ void with_registry_transaction(HKEY software, fs::path const& run_root, fs::path
     if (!journal.empty()) {
         incomplete.Insert(L"run", JsonValue::CreateStringValue(config.filename().native()));
         incomplete.Insert(L"sha256", JsonValue::CreateStringValue(file_hash(snapshot)));
+        incomplete.Insert(L"editor_processes", JsonArray{});
     }
     // A terminated writer can leave a partial file in its own run directory.
     // Recovery sees the marker only after the complete record has been flushed.
@@ -486,13 +522,13 @@ void with_registry_transaction(HKEY software, fs::path const& run_root, fs::path
 
 void with_journaled_transaction(HKEY software, fs::path const& journal,
     std::map<std::wstring, std::wstring> const& temporary_paths, JsonObject const& observations,
-    std::function<void(std::wstring const&)> const& run) {
+    std::function<void(fs::path const&)> const& run) {
     validate_journal(journal);
     fs::create_directories(journal);
     std::wstring id(CryptographicBuffer::EncodeToHexString(CryptographicBuffer::GenerateRandom(16)));
     auto dir = journal / id;
     if (!fs::create_directory(dir)) throw std::runtime_error("registry journal run already exists");
-    with_registry_transaction(software, journal, dir, temporary_paths, observations, [&] { run(id); }, journal);
+    with_registry_transaction(software, journal, dir, temporary_paths, observations, [&] { run(dir); }, journal);
 }
 
 int failure(hstring const& stage, hstring const& message, JsonObject const& diagnostics) {
@@ -546,8 +582,66 @@ BOOL CALLBACK observe_window(HWND window, LPARAM context) {
     return TRUE;
 }
 
-void bounded_startup(fs::path const& editor, DWORD duration, JsonObject const& diagnostics, std::wstring const& run) {
-    auto job_name = editor_job_name(run);
+void publish_job_evidence(fs::path const& run, JsonObject const& marker, wchar_t const* staging_name,
+    IJsonValue const& processes) {
+    marker.SetNamedValue(L"editor_processes", processes);
+    auto staged = run / staging_name;
+    write_new_json(staged, marker);
+    auto destination = run.parent_path() / L"registry-incomplete.json";
+    if (!MoveFileExW(staged.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        throw std::system_error(GetLastError(), std::system_category(), "publish editor job evidence");
+}
+
+void record_process_identity(JsonArray const& identities, DWORD pid, HANDLE process) {
+    JsonObject identity;
+    identity.Insert(L"pid", JsonValue::CreateNumberValue(pid));
+    identity.Insert(L"creation_time", JsonValue::CreateStringValue(std::to_wstring(process_creation_time(process))));
+    identities.Append(identity);
+}
+
+std::vector<handle> capture_job_processes(HANDLE job, DWORD main_pid, JsonArray const& identities) {
+    // Admit zero additional runnable processes, including descendants. Record
+    // the shrinking membership before initiating termination or closing the job.
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+    limits.BasicLimitInformation.ActiveProcessLimit = 0;
+    if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits)))
+        throw JobExitUnconfirmed("cannot stop editor job process admission");
+
+    constexpr auto offset = offsetof(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList);
+    std::vector<BYTE> buffer(offset + 16 * sizeof(ULONG_PTR));
+    for (;;) {
+        if (QueryInformationJobObject(job, JobObjectBasicProcessIdList, buffer.data(),
+            static_cast<DWORD>(buffer.size()), nullptr)) break;
+        if (GetLastError() != ERROR_MORE_DATA || buffer.size() > MAXDWORD / 2)
+            throw JobExitUnconfirmed("cannot enumerate editor job processes");
+        buffer.resize(buffer.size() * 2);
+    }
+    auto const& list = *reinterpret_cast<JOBOBJECT_BASIC_PROCESS_ID_LIST const*>(buffer.data());
+    if (list.NumberOfAssignedProcesses != list.NumberOfProcessIdsInList ||
+        list.NumberOfProcessIdsInList > (buffer.size() - offset) / sizeof(ULONG_PTR))
+        throw JobExitUnconfirmed("incomplete editor job process list");
+
+    std::vector<handle> processes;
+    for (DWORD i = 0; i < list.NumberOfProcessIdsInList; ++i) {
+        ULONG_PTR pid{};
+        std::memcpy(&pid, buffer.data() + offset + i * sizeof(pid), sizeof(pid));
+        if (!pid || pid > MAXDWORD) throw JobExitUnconfirmed("invalid editor job process ID");
+        if (pid == main_pid) continue; // The caller already owns this process handle.
+        auto process = open_job_process(static_cast<DWORD>(pid));
+        if (!process) continue;
+        BOOL member{};
+        if (!IsProcessInJob(process.get(), job, &member))
+            throw JobExitUnconfirmed("cannot verify editor job process membership");
+        if (!member) continue; // The recorded PID had exited and was reused.
+        record_process_identity(identities, static_cast<DWORD>(pid), process.get());
+        processes.push_back(std::move(process));
+    }
+    return processes;
+}
+
+void bounded_startup(fs::path const& editor, DWORD duration, JsonObject const& diagnostics, fs::path const& run) {
+    auto job_name = editor_job_name(run.filename().native());
     handle job(CreateJobObjectW(nullptr, job_name.c_str()));
     auto status = GetLastError();
     check_bool(bool(job));
@@ -572,6 +666,10 @@ void bounded_startup(fs::path const& editor, DWORD duration, JsonObject const& d
     startup.StartupInfo.cb = sizeof(startup);
     startup.lpAttributeList = attributes;
     PROCESS_INFORMATION child{};
+    auto marker = read_journal_json(run.parent_path() / L"registry-incomplete.json");
+    // Null marks the window in which a process may run but its full job
+    // membership is still unknown. Recovery must retain the snapshot then.
+    publish_job_evidence(run, marker, L"editor-launch.pending", JsonValue::CreateNullValue());
     check_bool(CreateProcessW((editor / L"ColorizingDMD.exe").c_str(), nullptr, nullptr, nullptr, FALSE,
         EXTENDED_STARTUPINFO_PRESENT, nullptr, editor.c_str(), &startup.StartupInfo, &child));
     handle process(child.hProcess), thread(child.hThread);
@@ -593,6 +691,17 @@ void bounded_startup(fs::path const& editor, DWORD duration, JsonObject const& d
     }
     // A signaled main process says nothing about descendants. Keep the job
     // handle until all members have exited, including on observation errors.
+    std::vector<handle> members;
+    try {
+        JsonArray identities;
+        record_process_identity(identities, child.dwProcessId, process.get());
+        members = capture_job_processes(job.get(), child.dwProcessId, identities);
+        publish_job_evidence(run, marker, L"editor-shutdown.pending", identities);
+    } catch (JobExitUnconfirmed const&) {
+        throw;
+    } catch (...) {
+        throw JobExitUnconfirmed("cannot persist complete editor job shutdown evidence");
+    }
     if (!TerminateJobObject(job.get(), ERROR_PROCESS_ABORTED))
         throw JobExitUnconfirmed("cannot terminate editor job");
     auto deadline = GetTickCount64() + 5000;
@@ -602,11 +711,14 @@ void bounded_startup(fs::path const& editor, DWORD duration, JsonObject const& d
         Sleep(10);
         info = job_accounting(job.get());
     }
-    // Accounting can reach zero immediately before the process handle signals.
-    auto now = GetTickCount64();
-    DWORD remaining = now < deadline ? static_cast<DWORD>(deadline - now) : 0;
-    if (WaitForSingleObject(process.get(), remaining) != WAIT_OBJECT_0)
-        throw JobExitUnconfirmed("cannot confirm main editor process exit");
+    // Accounting can reach zero immediately before a process handle signals.
+    auto wait_for_exit = [&](HANDLE object) {
+        auto now = GetTickCount64();
+        DWORD remaining = now < deadline ? static_cast<DWORD>(deadline - now) : 0;
+        if (!process_exited(object, remaining)) throw JobExitUnconfirmed("editor job process termination timed out");
+    };
+    for (auto const& member : members) wait_for_exit(member.get());
+    wait_for_exit(process.get());
     diagnostics.Insert(L"job_active_processes", JsonValue::CreateNumberValue(info.ActiveProcesses));
     diagnostics.Insert(L"job_total_processes", JsonValue::CreateNumberValue(info.TotalProcesses));
     DWORD exit_code{};
@@ -679,7 +791,7 @@ int preflight(JsonObject const& request, JsonObject const& diagnostics, bool lau
     require_editor_stopped();
     with_journaled_transaction(software(), journal, {{L"DIR_SERUM", projects}, {L"DIR_DUMPS", dir},
         {L"DIR_IMAGES", dir}, {L"DIR_GIFS", dir}, {L"DIR_VP", dir}, {L"DIR_AIIMG", dir}}, diagnostics,
-        [&](std::wstring const& run) { bounded_startup(editor, duration, diagnostics, run); });
+        [&](fs::path const& run) { bounded_startup(editor, duration, diagnostics, run); });
     return failure(L"startup-observation", L"Bounded startup ended; see the observed process and windows", diagnostics);
 }
 

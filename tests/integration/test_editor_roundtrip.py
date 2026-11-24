@@ -39,7 +39,7 @@ def registry_probe(tmp_path_factory):
 #include <tlhelp32.h>
 #include <cstdio>
 #include <string_view>
-bool late_editor{}, deny_accounting{}, stuck_job{}, delayed_signal{};
+bool late_editor{}, deny_accounting{}, stuck_job{}, delayed_signal{}, interrupt_shutdown{};
 unsigned scans{};
 BOOL WINAPI probe_first(HANDLE snapshot, LPPROCESSENTRY32W process) {
     auto ok = Process32FirstW(snapshot, process);
@@ -58,6 +58,21 @@ BOOL WINAPI probe_query_job(HANDLE job, JOBOBJECTINFOCLASS type, LPVOID data, DW
 }
 #define Process32FirstW probe_first
 #define QueryInformationJobObject probe_query_job
+BOOL WINAPI probe_terminate_job(HANDLE job, UINT exit_code) {
+    if (interrupt_shutdown) {
+        // Leave an actual worker alive beyond last-handle closure to make the
+        // kernel's asynchronous shutdown window deterministic.
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+        if (!QueryInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits), nullptr))
+            ExitProcess(81);
+        limits.BasicLimitInformation.LimitFlags &= ~JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits)))
+            ExitProcess(82);
+        ExitProcess(80);
+    }
+    return TerminateJobObject(job, exit_code);
+}
+#define TerminateJobObject probe_terminate_job
 DWORD WINAPI probe_wait(HANDLE object, DWORD timeout) {
     if (delayed_signal && timeout == 0) return WAIT_TIMEOUT;
     return WaitForSingleObject(object, timeout);
@@ -111,7 +126,8 @@ int wmain(int argc, wchar_t** argv) {
         STARTUPINFOW startup{sizeof(startup)};
         PROCESS_INFORMATION child{};
         wchar_t args[] = L"worker --descendant";
-        check_bool(CreateProcessW(argv[0], args, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startup, &child));
+        check_bool(CreateProcessW(L"settings-worker.exe", args, nullptr, nullptr, FALSE, 0, nullptr, nullptr,
+            &startup, &child));
         std::ofstream("descendant.txt") << child.dwProcessId;
         CloseHandle(child.hProcess); CloseHandle(child.hThread);
         return 0;
@@ -126,10 +142,11 @@ int wmain(int argc, wchar_t** argv) {
         deny_accounting = std::wstring_view(argv[2]) == L"accounting-failure";
         stuck_job = std::wstring_view(argv[2]) == L"timeout";
         delayed_signal = std::wstring_view(argv[2]) == L"delayed-signal";
+        interrupt_shutdown = std::wstring_view(argv[2]) == L"interrupted";
         JsonObject evidence;
         try {
             with_journaled_transaction(hive, root / L"journal", {{L"DIR_SERUM", L"temporary"}}, evidence,
-                [&](std::wstring const& run) { bounded_startup(root, 4000, evidence, run); });
+                [&](auto const& run) { bounded_startup(root, 4000, evidence, run); });
         } catch (std::exception const& error) {
             evidence.Insert(L"error", JsonValue::CreateStringValue(to_hstring(error.what())));
         }
@@ -295,7 +312,8 @@ def interrupted_editor(registry_probe, tmp_path):
                                     "keys": {"": {}, "Nested": {"raw": {"type": 3, "hex": "00ff"}}}}))
     marker = journal / "registry-incomplete.json"
     marker.write_text(json.dumps({"schema_version": 1, "run": run.name, "snapshot": snapshot.name,
-                                  "sha256": hashlib.sha256(snapshot.read_bytes()).hexdigest()}))
+                                  "sha256": hashlib.sha256(snapshot.read_bytes()).hexdigest(),
+                                  "editor_processes": []}))
     hive = ctypes.c_void_p()
     api = ctypes.windll.advapi32
     assert api.RegLoadAppKeyW(str(tmp_path / "fixture.hiv"), ctypes.byref(hive),
@@ -338,25 +356,25 @@ def test_interrupted_registry_restored_before_new_transaction(interrupted_editor
     assert invoke()["registry_recovery"]["restored"] is False
 
 
-def test_interrupted_job_with_live_descendant_defers_recovery(interrupted_editor, registry_probe):
-    invoke, _, marker, snapshot, called, _ = interrupted_editor
-    api = ctypes.windll.kernel32
-    api.CreateJobObjectW.restype = ctypes.c_void_p
-    job = ctypes.c_void_p(api.CreateJobObjectW(None, "Global\\DMDMaskOptimizer-EditorJob-" + snapshot.parent.name))
-    assert job.value
-    try:
-        with subprocess.Popen([registry_probe.executable, "--descendant"]) as child:
-            try:
-                assert api.AssignProcessToJobObject(job, ctypes.c_void_p(int(child._handle)))
-                evidence = invoke()
-                assert "active processes" in evidence.get("error", ""), evidence
-                assert not called and marker.is_file()
-            finally:
-                child.terminate()
-                child.wait(timeout=5)
-        assert invoke()["registry_recovery"]["restored"] and not marker.exists()
-    finally:
-        assert api.CloseHandle(job)
+@pytest.mark.parametrize("legacy", [False, True])
+def test_interrupted_job_with_incomplete_evidence_retains_marker(interrupted_editor, legacy):
+    import winreg
+
+    invoke, hive, marker, _, called, _ = interrupted_editor
+    record = json.loads(marker.read_bytes())
+    if legacy:
+        del record["editor_processes"]
+    else:
+        record["editor_processes"] = None
+    marker.write_text(json.dumps(record))
+    original = marker.read_bytes()
+
+    evidence = invoke()
+    assert "no complete shutdown evidence" in evidence.get("error", ""), evidence
+    assert evidence["registry_recovery"]["restored"] is False
+    assert not called and marker.read_bytes() == original
+    with winreg.OpenKey(hive, "ColorizingDMD") as key:
+        assert winreg.QueryValueEx(key, "dirty")[0] == "interrupted"
 
 
 def test_interrupted_marker_write_leaves_no_recovery_or_registry_changes(registry_probe, tmp_path):
@@ -1009,6 +1027,7 @@ def test_job_must_be_confirmed_empty_before_registry_restore(registry_probe, tmp
     import winreg
 
     shutil.copyfile(registry_probe.executable, tmp_path / "ColorizingDMD.exe")
+    shutil.copyfile(registry_probe.executable, tmp_path / "settings-worker.exe")
     completed = subprocess.run([registry_probe.executable, "--job-test", mode], cwd=tmp_path,
                                capture_output=True, timeout=45, check=True)
     evidence = json.loads(completed.stdout)
@@ -1034,6 +1053,69 @@ def test_job_must_be_confirmed_empty_before_registry_restore(registry_probe, tmp
                 assert winreg.QueryValueEx(key, "DIR_SERUM")[0] == "temporary"
         finally:
             assert api.RegCloseKey(hive) == 0
+
+
+def test_interrupted_last_job_handle_defers_recovery_until_worker_exits(registry_probe, tmp_path):
+    import winreg
+
+    shutil.copyfile(registry_probe.executable, tmp_path / "ColorizingDMD.exe")
+    shutil.copyfile(registry_probe.executable, tmp_path / "settings-worker.exe")
+    completed = subprocess.run([registry_probe.executable, "--job-test", "interrupted"], cwd=tmp_path,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=45)
+    worker_pid = int((tmp_path / "descendant.txt").read_text())
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.restype = ctypes.c_void_p
+    kernel.OpenJobObjectW.restype = ctypes.c_void_p
+    worker = ctypes.c_void_p(kernel.OpenProcess(0x100001, False, worker_pid))  # SYNCHRONIZE | PROCESS_TERMINATE
+    assert worker.value
+    try:
+        assert completed.returncode == 80, completed
+        assert kernel.WaitForSingleObject(worker, 0) == 258  # WAIT_TIMEOUT
+        journal = tmp_path / "journal"
+        marker = journal / "registry-incomplete.json"
+        original = marker.read_bytes()
+        job_name = "Global\\DMDMaskOptimizer-EditorJob-" + json.loads(original)["run"]
+        assert not kernel.OpenJobObjectW(4, False, job_name)  # JOB_OBJECT_QUERY
+        assert ctypes.get_last_error() == 2  # ERROR_FILE_NOT_FOUND
+
+        hive = ctypes.c_void_p()
+        registry = ctypes.windll.advapi32
+        assert registry.RegLoadAppKeyW(str(tmp_path / "fixture.hiv"), ctypes.byref(hive),
+                                       winreg.KEY_ALL_ACCESS, 1, 0) == 0
+        calls = []
+
+        @ctypes.CFUNCTYPE(ctypes.c_int)
+        def operation():
+            calls.append(True)
+            return 0
+
+        def recover():
+            return json.loads(registry_probe.gate(hive.value, str(journal), "Local\\DMD-Test-" +
+                                                  tmp_path.name, operation))
+
+        try:
+            assert kernel.WaitForSingleObject(worker, 0) == 258  # WAIT_TIMEOUT
+            evidence = recover()
+            assert evidence["registry_recovery"]["restored"] is False, evidence
+            assert "active processes" in evidence.get("error", ""), evidence
+            assert not calls and marker.read_bytes() == original
+            with winreg.OpenKey(hive.value, "ColorizingDMD") as key:
+                assert winreg.QueryValueEx(key, "DIR_SERUM")[0] == "temporary"
+
+            assert kernel.TerminateProcess(worker, 0)
+            assert kernel.WaitForSingleObject(worker, 5000) == 0  # WAIT_OBJECT_0
+            evidence = recover()
+            assert evidence["registry_recovery"]["restored"] is True, evidence
+            assert calls == [True] and not marker.exists()
+            with pytest.raises(FileNotFoundError):
+                winreg.OpenKey(hive.value, "ColorizingDMD")
+        finally:
+            assert registry.RegCloseKey(hive) == 0
+    finally:
+        if kernel.WaitForSingleObject(worker, 0) == 258:
+            kernel.TerminateProcess(worker, 0)
+            kernel.WaitForSingleObject(worker, 5000)
+        assert kernel.CloseHandle(worker)
 
 
 def test_late_editor_blocks_fresh_transaction(installed_artifacts, case, profile, registry_probe, tmp_path):
