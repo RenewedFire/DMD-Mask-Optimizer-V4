@@ -1,4 +1,4 @@
-// Read-only startup preflight for the pinned Twister authoring build.
+// Bounded original-editor capability probes for the pinned Twister authoring build.
 #include <windows.h>
 #include <sddl.h>
 #include <tlhelp32.h>
@@ -640,7 +640,10 @@ std::vector<handle> capture_job_processes(HANDLE job, DWORD main_pid, JsonArray 
     return processes;
 }
 
-void bounded_startup(fs::path const& editor, DWORD duration, JsonObject const& diagnostics, fs::path const& run) {
+#include "editor_import_probe.h"
+
+void bounded_startup(fs::path const& editor, DWORD duration, JsonObject const& diagnostics, fs::path const& run,
+    std::function<void(DWORD)> const& inspect = {}) {
     auto job_name = editor_job_name(run.filename().native());
     handle job(CreateJobObjectW(nullptr, job_name.c_str()));
     auto status = GetLastError();
@@ -686,6 +689,7 @@ void bounded_startup(fs::path const& editor, DWORD duration, JsonObject const& d
         JsonArray titles;
         for (auto const& title : observation.titles) titles.Append(JsonValue::CreateStringValue(title));
         diagnostics.Insert(L"visible_window_titles", titles);
+        if (inspect) inspect(child.dwProcessId);
     } catch (...) {
         observation_error = std::current_exception();
     }
@@ -729,7 +733,8 @@ void bounded_startup(fs::path const& editor, DWORD duration, JsonObject const& d
 }
 
 int preflight(JsonObject const& request, JsonObject const& diagnostics, bool launch,
-              fs::path const& journal, std::function<HKEY()> const& software, hstring& stage) {
+              fs::path const& journal, std::function<HKEY()> const& software, hstring& stage,
+              bool import_probe = false) {
     if (request.GetNamedNumber(L"schema_version") != 1 ||
         request.GetNamedString(L"expected_decoder_sha256") != decoder_hash)
         throw std::runtime_error("unsupported request version or decoder lock");
@@ -787,11 +792,21 @@ int preflight(JsonObject const& request, JsonObject const& diagnostics, bool lau
             throw std::runtime_error("editor startup paths must be representable by the pinned ANSI editor");
     }
     auto duration = static_cast<DWORD>((std::min)(request.GetNamedNumber(L"deadline_ms"), 5000.0));
+    std::function<void(DWORD)> inspect;
+    if (import_probe) {
+        stage = L"import-input";
+        auto input = editor_import::write_dump(project, request.GetNamedArray(L"references"));
+        auto deadline = GetTickCount64() +
+            static_cast<ULONGLONG>((std::min)(request.GetNamedNumber(L"deadline_ms"), 25000.0));
+        inspect = [&, input, deadline](DWORD pid) { editor_import::operate(pid, input, deadline, diagnostics); };
+    }
     stage = L"registry-transaction";
     require_editor_stopped();
     with_journaled_transaction(software(), journal, {{L"DIR_SERUM", projects}, {L"DIR_DUMPS", dir},
         {L"DIR_IMAGES", dir}, {L"DIR_GIFS", dir}, {L"DIR_VP", dir}, {L"DIR_AIIMG", dir}}, diagnostics,
-        [&](fs::path const& run) { bounded_startup(editor, duration, diagnostics, run); });
+        [&](fs::path const& run) { bounded_startup(editor, duration, diagnostics, run, inspect); });
+    if (import_probe)
+        return failure(L"import-observation", L"Editor imported three references; no round-trip manifest", diagnostics);
     return failure(L"startup-observation", L"Bounded startup ended; see the observed process and windows", diagnostics);
 }
 
@@ -838,10 +853,11 @@ int main(int argc, char** argv) {
             };
             return with_editor_isolation(journal, owner.c_str(), open_software, diagnostics, [&] {
                 stage = L"request";
-                bool launch = argc == 2 && std::string_view(argv[1]) == "--startup-preflight";
+                bool import_probe = argc == 2 && std::string_view(argv[1]) == "--import-probe";
+                bool launch = import_probe || (argc == 2 && std::string_view(argv[1]) == "--startup-preflight");
                 if (argc != 1 && !launch) throw std::runtime_error("unknown editor bridge option");
                 return preflight(JsonObject::Parse(to_hstring(read_request())), diagnostics,
-                    launch, journal, open_software, stage);
+                    launch, journal, open_software, stage, import_probe);
             });
         } catch (hresult_error const& error) {
             return failure(stage, error.message(), diagnostics);

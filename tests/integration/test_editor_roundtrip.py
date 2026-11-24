@@ -1228,6 +1228,40 @@ def test_real_startup_preflight(installed_artifacts, locked_profile, case):
     assert diagnostics["decoder_sha256"] == PINNED_DECODER
 
 
+@pytest.mark.skipif(os.environ.get("DMD_EDITOR_IMPORT_PROBE") != "1",
+                    reason="explicit real-editor three-reference import probe")
+def test_real_three_reference_import(installed_artifacts, locked_profile, case):
+    source, decoder = installed_artifacts
+    repo = Path(__file__).resolve().parents[2]
+    run = repo / "artifacts" / f"import-{uuid.uuid4().hex[:12]}"
+    stage = stage_editor(source, run / "editor", locked_profile, decoder_path=decoder)
+    config = run / "config"
+    config.mkdir()
+    project = run / "project"
+    request = serialize_request(project, case, locked_profile, editor_root=stage,
+                                config_root=config, deadline_ms=25_000)
+    bridge = os.environ.get("DMD_EDITOR_BRIDGE_PATH", repo / "build" / "editor_bridge.exe")
+    result = subprocess.run([bridge, "--import-probe"], input=request.encode(), capture_output=True, timeout=35)
+    (run / "bridge.stdout").write_bytes(result.stdout)
+    (run / "bridge.stderr").write_bytes(result.stderr)
+    response = json.loads(result.stdout)
+    assert response["stage"] == "import-observation", (run, response)
+    assert response["status"] == "error" and result.returncode == 1  # still no round-trip manifest
+    diagnostics = response["diagnostics"]
+    assert "twst_405" in diagnostics["imported_title"]
+    assert "current 0 / 1 selected / 3 total" in diagnostics["imported_title"]
+    assert diagnostics["editor_exited"] and diagnostics["job_active_processes"] == 0
+    transaction = diagnostics["registry_transaction"]
+    assert transaction["verified"] and not Path(transaction["marker_path"]).exists()
+    batches = (project / "twst_405.txt").read_bytes().rstrip().split(b"\r\n\r\n")
+    assert len(batches) == len(case)
+    for batch, ref in zip(batches, case, strict=True):
+        timestamp, *rows = batch.splitlines()
+        assert timestamp.startswith(b"0x") and len(rows) == 32
+        assert all(len(row) == 128 for row in rows)
+        assert bytes(value - ord("0") for value in b"".join(rows)) == ref.native_pixels
+
+
 @pytest.mark.skipif(os.environ.get("DMD_EDITOR_ROUNDTRIP") != "1",
                     reason="set DMD_EDITOR_ROUNDTRIP=1 to require the original-editor round trip")
 def test_original_editor_roundtrip(installed_artifacts, case, locked_profile, tmp_path):
