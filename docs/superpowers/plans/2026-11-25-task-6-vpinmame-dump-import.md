@@ -4,7 +4,12 @@
 
 **Goal:** Treat VPinMAME's built-in per-ROM DMD text dumps as the supported acquisition format and import explicitly selected dump files into the optimizer corpus.
 
-**Architecture:** VPinMAME records frames during normal play or attract mode into its `dmddump` directory. The optimizer runs later, reads explicitly selected `.txt` files through the existing strict `timestamped-text-v1` parser, and appends each file as its own immutable corpus capture. It does not launch PinMAME, watch `dmddump`, alter VPinMAME configuration, or maintain a second live recorder.
+**Architecture:** For this build the canonical source is the fixed project copy
+`C:\\DMD Colorization\\DMD Mask Optimizer V4\\twst_405.txt`. The optimizer
+reads that file through the existing strict `timestamped-text-v1` parser and
+appends it as an immutable corpus capture. VPinMAME may create new live dumps,
+but they are not inputs to this build unless deliberately copied, locked, and
+qualified in a later revision.
 
 **Tech Stack:** Existing Python dump parser and corpus store; VPinMAME's installed dump feature.
 
@@ -13,7 +18,8 @@
 ## Global Constraints
 
 - VPinMAME remains the sole producer. The optimizer must not start, configure, or interfere with it.
-- Users explicitly select one or more completed dump files; folder watching and automatic import are out of scope.
+- The canonical input is `C:\\DMD Colorization\\DMD Mask Optimizer V4\\twst_405.txt`, SHA-256 `f711aec5d42fdc423ca02bfd2c8f05c158afaee27a97acdbf59d532b81095b11`, size 60,285,082 bytes.
+- Folder watching, automatic import, and direct import from VPinMAME's mutable `dmddump` directory are out of scope.
 - Each source file remains a separate corpus capture with its own SHA-256, path, producer configuration, occurrence order, repeats, ticks, and source positions.
 - Accept only the proven `timestamped-text-v1` grammar: 128x32 native values `0`--`3`, a hexadecimal tick header, and a blank delimiter.
 - A malformed or incomplete dump fails without creating a corpus revision. Unknown tick units remain unknown.
@@ -26,7 +32,7 @@
 
 ## Completion Gate
 
-Task 6 is complete when a user-selected VPinMAME `twst_405` dump has passed the strict reader and corpus round trip, with its own provenance, and when the documented workflow explains how additional completed dump files are added as separate captures. It does not certify complete gameplay coverage; that remains Task 7.
+Task 6 is complete when the fixed project `twst_405.txt` dump has passed the strict reader and corpus round trip, with its own provenance. Additional dumps require an explicit later intake and qualification step. This does not certify complete gameplay coverage; that remains Task 7.
 
 ## Execution result — 2026-11-25
 

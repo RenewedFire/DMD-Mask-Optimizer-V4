@@ -24,7 +24,16 @@ all **15,291** records without a format error. Its identity is intentionally
 kept separate from the earlier locked 14,443-record fixture: it is a different
 user-produced capture, not a replacement for that fixture.
 
-## Revised Task 6 qualification result
+## Canonical static dump for this build
+
+The sole input for this build is
+`C:\\DMD Colorization\\DMD Mask Optimizer V4\\twst_405.txt`, not the mutable
+VPinMAME `dmddump` file. Its measured identity is 60,285,082 bytes and
+SHA-256 `f711aec5d42fdc423ca02bfd2c8f05c158afaee27a97acdbf59d532b81095b11`.
+Future VPinMAME gameplay may continue to update its own dump, but cannot alter
+this locked project input or an already-created corpus revision.
+
+## Earlier intake proof
 
 The selected VPinMAME dump was imported into the isolated worktree corpus at
 `artifacts/task6-vpinmame-dump-corpus-final`. The resulting immutable revision
