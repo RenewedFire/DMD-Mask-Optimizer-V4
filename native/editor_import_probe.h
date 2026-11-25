@@ -59,47 +59,53 @@ HWND find(DWORD pid, HWND parent, std::wstring_view klass, int id = -1, std::wst
     return search.count == 1 ? search.handle : nullptr;
 }
 
-void operate(DWORD pid, fs::path const& dump, ULONGLONG deadline, JsonObject const& evidence) {
-    auto wait = [&](char const* description, auto find_expected) {
-        while (GetTickCount64() < deadline) {
-            if (auto window = find_expected()) return window;
-            Sleep(35);
-        }
-        throw std::runtime_error(std::string("import timed out waiting for ") + description);
-    };
-    auto click = [](HWND button) {
-        if (!button || !IsWindowEnabled(button)) throw std::runtime_error("missing enabled import button");
-        check_bool(PostMessageW(button, BM_CLICK, 0, 0));
-    };
-    auto send = [&](HWND control, UINT message, LPARAM parameter = 0) {
-        auto now = GetTickCount64();
-        DWORD_PTR result{};
-        if (!control || now >= deadline || !SendMessageTimeoutW(control, message, 0, parameter,
-            SMTO_ABORTIFHUNG | SMTO_BLOCK, static_cast<UINT>((std::min)(deadline - now, 1200ULL)), &result))
-            throw std::runtime_error("import control missing or unresponsive");
-        return result;
-    };
+HWND wait(ULONGLONG deadline, char const* description, auto find_expected) {
+    while (GetTickCount64() < deadline) {
+        if (auto window = find_expected()) return window;
+        Sleep(35);
+    }
+    throw std::runtime_error(std::string("timed out waiting for ") + description);
+}
 
-    auto main = wait("main editor", [&] { return find(pid, nullptr, L"ColorizingDMD"); });
-    click(wait("New toolbar button", [&] { return find(pid, main, L"Button", 1001); }));
-    auto dialog = wait("initial TXT chooser", [&] {
-        return find(pid, nullptr, L"#32770", -1, L"Choose the initial TXT file");
+void click(HWND button) {
+    if (!button || !IsWindowEnabled(button)) throw std::runtime_error("missing enabled editor button");
+    check_bool(PostMessageW(button, BM_CLICK, 0, 0));
+}
+
+DWORD_PTR send(ULONGLONG deadline, HWND control, UINT message, WPARAM word = 0, LPARAM parameter = 0) {
+    auto now = GetTickCount64();
+    DWORD_PTR result{};
+    if (!control || now >= deadline || !SendMessageTimeoutW(control, message, word, parameter,
+        SMTO_ABORTIFHUNG | SMTO_BLOCK, static_cast<UINT>((std::min)(deadline - now, 1200ULL)), &result))
+        throw std::runtime_error("editor control missing or unresponsive");
+    return result;
+}
+
+void submit_file(DWORD pid, wchar_t const* title, fs::path const& path, ULONGLONG deadline) {
+    auto dialog = wait(deadline, "editor file chooser", [&] {
+        return find(pid, nullptr, L"#32770", -1, title);
     });
     auto filename = find(pid, dialog, L"Edit", 0x480);  // Win32 common-dialog edt1 / cmb13
     if (!filename) {
         auto combo = find(pid, dialog, L"ComboBox", 0x47c);
         if (combo) filename = find(pid, combo, L"Edit");
     }
-    if (!send(filename, WM_SETTEXT, reinterpret_cast<LPARAM>(dump.c_str())))
-        throw std::runtime_error("editor rejected the generated TXT filename");
+    if (!send(deadline, filename, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(path.c_str())))
+        throw std::runtime_error("editor rejected the generated filename");
     click(GetDlgItem(dialog, IDOK));
-    auto filters = wait("Filter options", [&] { return find(pid, nullptr, L"#32770", -1, L"Filter options"); });
+}
+
+void operate(DWORD pid, fs::path const& dump, ULONGLONG deadline, JsonObject const& evidence) {
+    auto main = wait(deadline, "main editor", [&] { return find(pid, nullptr, L"ColorizingDMD"); });
+    click(wait(deadline, "New toolbar button", [&] { return find(pid, main, L"Button", 1001); }));
+    submit_file(pid, L"Choose the initial TXT file", dump, deadline);
+    auto filters = wait(deadline, "Filter options", [&] { return find(pid, nullptr, L"#32770", -1, L"Filter options"); });
     for (auto id : {1118, 1120, 1121})
-        if (send(GetDlgItem(filters, id), BM_GETCHECK) != BST_UNCHECKED)
+        if (send(deadline, GetDlgItem(filters, id), BM_GETCHECK) != BST_UNCHECKED)
             throw std::runtime_error("editor import filters would discard generated frames");
     click(GetDlgItem(filters, IDOK));
     wchar_t caption[512]{};
-    wait("twst_405 with three frames", [&]() -> HWND {
+    wait(deadline, "twst_405 with three frames", [&]() -> HWND {
         GetWindowTextW(main, caption, 512);
         std::wstring_view title(caption);
         return title.find(L"ROM name: twst_405 ") != title.npos &&

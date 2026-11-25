@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import zipfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -245,9 +246,14 @@ def serialize_request(
 
 def write_project(
     folder: Path, refs: Sequence[Reference], profile: Profile, *, editor_root: Path | None = None,
-    deadline_ms: int = 60_000, startup_preflight: bool = False,
+    deadline_ms: int = 60_000, startup_preflight: bool = False, roundtrip: bool = False,
 ) -> ProjectFiles:
-    """Run the original-editor preflight and retain its diagnostics in a fresh config root."""
+    """Run an explicitly selected editor operation and validate its saved fixture."""
+    if startup_preflight and roundtrip:
+        raise EditorBridgeError("select a single editor operation")
+    options = ["--roundtrip"] if roundtrip else []
+    if startup_preflight:
+        options = ["--startup-preflight"]
     request = serialize_request(folder, refs, profile, editor_root=editor_root, deadline_ms=deadline_ms)
     default_bridge = Path(__file__).resolve().parents[3] / "build" / "editor_bridge.exe"
     bridge = Path(os.environ.get("DMD_EDITOR_BRIDGE_PATH", default_bridge)).resolve()
@@ -259,9 +265,9 @@ def write_project(
         config.mkdir(parents=True, exist_ok=False)
         try:
             result = subprocess.run(
-                [str(bridge), *(["--startup-preflight"] if startup_preflight else [])],
+                [str(bridge), *options],
                 input=request.encode("utf-8"), capture_output=True, cwd=config,
-                timeout=deadline_ms / 1000 + (15 if startup_preflight else 0), check=False,
+                timeout=deadline_ms / 1000 + (15 if startup_preflight or roundtrip else 0), check=False,
             )
         except subprocess.TimeoutExpired as exc:
             (config / "bridge.stdout").write_bytes(exc.stdout or b"")
@@ -292,6 +298,42 @@ def write_project(
     if result.returncode:
         raise EditorBridgeError(f"editor bridge exit code {result.returncode}; see {config}",
                                 diagnostics=diagnostics)
-    # The capability probe cannot attest to a save, reopen, or export.
-    raise EditorBridgeError(f"no verified original-editor round-trip manifest; see {config}",
-                            diagnostics=diagnostics)
+    if not roundtrip or response.get("status") != "ok" or response.get("sidecar_path") != "roundtrip.json":
+        raise EditorBridgeError(f"no verified original-editor round-trip manifest; see {config}",
+                                diagnostics=diagnostics)
+    return _verify_saved_project(folder.resolve(), response, refs)
+
+
+def _verify_saved_project(root: Path, response: dict, refs: Sequence[Reference]) -> ProjectFiles:
+    manifest = root / "roundtrip.json"
+    export = root / "twst_405.cRZ"
+    try:
+        if json.loads(manifest.read_bytes()) != response or response["runtime_export"] != export.name:
+            raise ValueError("bridge response differs from saved sidecar")
+        entries = response["files"]
+        expected = {"twst_405.cROM", "twst_405.cRP", export.name}
+        if len(entries) != len(expected) or {entry["path"] for entry in entries} != expected:
+            raise ValueError("companion file inventory differs")
+        for entry in entries:
+            content = (root / entry["path"]).read_bytes()
+            if len(content) != entry["size"] or hashlib.sha256(content).hexdigest() != entry["sha256"]:
+                raise ValueError(f"companion fingerprint differs for {entry['path']}")
+        with zipfile.ZipFile(export) as package:
+            if (package.namelist() != ["twst_405.cRom"]
+                    or package.read("twst_405.cRom") != (root / "twst_405.cROM").read_bytes()):
+                raise ValueError("runtime package differs from the freshly saved cROM")
+        for ordinal, (entry, ref) in enumerate(zip(response["references"], refs, strict=True)):
+            mask_digest = hashlib.sha256(ref.ignore_bitmap).hexdigest() if ref.ignore_bitmap is not None else None
+            if (entry["id"] != ref.id or entry["ordinal"] != ordinal or bytes(entry["native_pixels"]) != ref.native_pixels
+                    or entry["shape"] != ref.shape or entry["ignore_sha256"] != mask_digest):
+                raise ValueError(f"reopened reference differs at ordinal {ordinal}")
+        observations = response["observations"]
+        sessions = (observations, observations["reopen"])
+        if not (all(s["registry_transaction"]["verified"] and s["editor_exited"]
+                    and s["job_active_processes"] == 0 for s in sessions)
+                and observations["editor_pid"] != observations["reopen"]["editor_pid"]
+                and observations["decoder_loaded_export"] and observations["reopen"]["fresh_save_and_export"]):
+            raise ValueError("missing restoration, fresh export, or decoder evidence")
+    except (KeyError, TypeError, OSError, ValueError, zipfile.BadZipFile) as exc:
+        raise EditorBridgeError(f"invalid round-trip manifest or package: {exc}; see {root}") from exc
+    return ProjectFiles(root, manifest, export, observations)

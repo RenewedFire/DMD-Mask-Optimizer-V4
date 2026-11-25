@@ -641,6 +641,7 @@ std::vector<handle> capture_job_processes(HANDLE job, DWORD main_pid, JsonArray 
 }
 
 #include "editor_import_probe.h"
+#include "editor_roundtrip.h"
 
 void bounded_startup(fs::path const& editor, DWORD duration, JsonObject const& diagnostics, fs::path const& run,
     std::function<void(DWORD)> const& inspect = {}) {
@@ -732,9 +733,28 @@ void bounded_startup(fs::path const& editor, DWORD duration, JsonObject const& d
     if (observation_error) std::rethrow_exception(observation_error);
 }
 
+int finish_roundtrip(HKEY software, fs::path const& journal, std::map<std::wstring, std::wstring> const& paths,
+                     fs::path const& editor, fs::path const& project, fs::path const& config,
+                     DWORD duration, ULONGLONG deadline, editor_import::SaveTimes const& previous,
+                     JsonArray const& refs, JsonObject const& diagnostics, hstring& stage) {
+    stage = L"fresh-reopen";
+    JsonObject reopened;
+    diagnostics.SetNamedValue(L"reopen", reopened);
+    require_editor_stopped();
+    with_journaled_transaction(software, journal, paths, reopened, [&](fs::path const& run) {
+        bounded_startup(editor, duration, reopened, run, [&](DWORD pid) {
+            editor_import::reopen_and_export(pid, project, deadline, previous, reopened);
+        });
+    });
+    stage = L"roundtrip-validation";
+    auto result = editor_import::inspect_project(editor, project, config, refs, diagnostics);
+    std::cout << to_string(result.Stringify()) << '\n';
+    return 0;
+}
+
 int preflight(JsonObject const& request, JsonObject const& diagnostics, bool launch,
               fs::path const& journal, std::function<HKEY()> const& software, hstring& stage,
-              bool import_probe = false) {
+              bool import_probe = false, bool save_probe = false, bool roundtrip = false) {
     if (request.GetNamedNumber(L"schema_version") != 1 ||
         request.GetNamedString(L"expected_decoder_sha256") != decoder_hash)
         throw std::runtime_error("unsupported request version or decoder lock");
@@ -793,18 +813,37 @@ int preflight(JsonObject const& request, JsonObject const& diagnostics, bool lau
     }
     auto duration = static_cast<DWORD>((std::min)(request.GetNamedNumber(L"deadline_ms"), 5000.0));
     std::function<void(DWORD)> inspect;
-    if (import_probe) {
+    auto references = request.GetNamedArray(L"references");
+    auto deadline = GetTickCount64() +
+        static_cast<ULONGLONG>((std::min)(request.GetNamedNumber(L"deadline_ms"), 60000.0));
+    editor_import::SaveTimes previous{};
+    if (import_probe || save_probe || roundtrip) {
         stage = L"import-input";
-        auto input = editor_import::write_dump(project, request.GetNamedArray(L"references"));
-        auto deadline = GetTickCount64() +
-            static_cast<ULONGLONG>((std::min)(request.GetNamedNumber(L"deadline_ms"), 25000.0));
-        inspect = [&, input, deadline](DWORD pid) { editor_import::operate(pid, input, deadline, diagnostics); };
+        if (save_probe || roundtrip) editor_import::require_mask_fixture(references);
+        auto input = editor_import::write_dump(project, references);
+        inspect = [&, input](DWORD pid) {
+            stage = L"import";
+            editor_import::operate(pid, input, deadline, diagnostics);
+            if (save_probe || roundtrip) {
+                stage = L"mask-assignment";
+                editor_import::apply_fixture_mask(pid, deadline, diagnostics);
+                stage = L"first-save";
+                previous = editor_import::first_save(pid, project, deadline);
+            }
+        };
     }
     stage = L"registry-transaction";
     require_editor_stopped();
-    with_journaled_transaction(software(), journal, {{L"DIR_SERUM", projects}, {L"DIR_DUMPS", dir},
-        {L"DIR_IMAGES", dir}, {L"DIR_GIFS", dir}, {L"DIR_VP", dir}, {L"DIR_AIIMG", dir}}, diagnostics,
+    std::map<std::wstring, std::wstring> paths{{L"DIR_SERUM", projects}, {L"DIR_DUMPS", dir},
+        {L"DIR_IMAGES", dir}, {L"DIR_GIFS", dir}, {L"DIR_VP", dir}, {L"DIR_AIIMG", dir}};
+    with_journaled_transaction(software(), journal, paths, diagnostics,
         [&](fs::path const& run) { bounded_startup(editor, duration, diagnostics, run, inspect); });
+    if (roundtrip) {
+        return finish_roundtrip(software(), journal, paths, editor, project, config, duration, deadline,
+                                previous, references, diagnostics, stage);
+    }
+    if (save_probe)
+        return failure(L"save-observation", L"Editor saved the shared-mask fixture", diagnostics);
     if (import_probe)
         return failure(L"import-observation", L"Editor imported three references; no round-trip manifest", diagnostics);
     return failure(L"startup-observation", L"Bounded startup ended; see the observed process and windows", diagnostics);
@@ -854,10 +893,13 @@ int main(int argc, char** argv) {
             return with_editor_isolation(journal, owner.c_str(), open_software, diagnostics, [&] {
                 stage = L"request";
                 bool import_probe = argc == 2 && std::string_view(argv[1]) == "--import-probe";
-                bool launch = import_probe || (argc == 2 && std::string_view(argv[1]) == "--startup-preflight");
+                bool save_probe = argc == 2 && std::string_view(argv[1]) == "--save-probe";
+                bool roundtrip = argc == 2 && std::string_view(argv[1]) == "--roundtrip";
+                bool launch = import_probe || save_probe || roundtrip ||
+                    (argc == 2 && std::string_view(argv[1]) == "--startup-preflight");
                 if (argc != 1 && !launch) throw std::runtime_error("unknown editor bridge option");
                 return preflight(JsonObject::Parse(to_hstring(read_request())), diagnostics,
-                    launch, journal, open_software, stage, import_probe);
+                    launch, journal, open_software, stage, import_probe, save_probe, roundtrip);
             });
         } catch (hresult_error const& error) {
             return failure(stage, error.message(), diagnostics);

@@ -7,6 +7,7 @@ import struct
 import subprocess
 import tempfile
 import uuid
+import zipfile
 from dataclasses import replace
 from pathlib import Path
 
@@ -1228,12 +1229,10 @@ def test_real_startup_preflight(installed_artifacts, locked_profile, case):
     assert diagnostics["decoder_sha256"] == PINNED_DECODER
 
 
-@pytest.mark.skipif(os.environ.get("DMD_EDITOR_IMPORT_PROBE") != "1",
-                    reason="explicit real-editor three-reference import probe")
-def test_real_three_reference_import(installed_artifacts, locked_profile, case):
+def run_editor_probe(option, installed_artifacts, locked_profile, case):
     source, decoder = installed_artifacts
     repo = Path(__file__).resolve().parents[2]
-    run = repo / "artifacts" / f"import-{uuid.uuid4().hex[:12]}"
+    run = repo / "artifacts" / f"{option}-{uuid.uuid4().hex[:12]}"
     stage = stage_editor(source, run / "editor", locked_profile, decoder_path=decoder)
     config = run / "config"
     config.mkdir()
@@ -1241,11 +1240,11 @@ def test_real_three_reference_import(installed_artifacts, locked_profile, case):
     request = serialize_request(project, case, locked_profile, editor_root=stage,
                                 config_root=config, deadline_ms=25_000)
     bridge = os.environ.get("DMD_EDITOR_BRIDGE_PATH", repo / "build" / "editor_bridge.exe")
-    result = subprocess.run([bridge, "--import-probe"], input=request.encode(), capture_output=True, timeout=35)
+    result = subprocess.run([bridge, f"--{option}-probe"], input=request.encode(), capture_output=True, timeout=40)
     (run / "bridge.stdout").write_bytes(result.stdout)
     (run / "bridge.stderr").write_bytes(result.stderr)
     response = json.loads(result.stdout)
-    assert response["stage"] == "import-observation", (run, response)
+    assert response["stage"] == f"{option}-observation", (run, response)
     assert response["status"] == "error" and result.returncode == 1  # still no round-trip manifest
     diagnostics = response["diagnostics"]
     assert "twst_405" in diagnostics["imported_title"]
@@ -1253,6 +1252,13 @@ def test_real_three_reference_import(installed_artifacts, locked_profile, case):
     assert diagnostics["editor_exited"] and diagnostics["job_active_processes"] == 0
     transaction = diagnostics["registry_transaction"]
     assert transaction["verified"] and not Path(transaction["marker_path"]).exists()
+    return project, diagnostics
+
+
+@pytest.mark.skipif(os.environ.get("DMD_EDITOR_IMPORT_PROBE") != "1",
+                    reason="explicit real-editor three-reference import probe")
+def test_real_three_reference_import(installed_artifacts, locked_profile, case):
+    project, _ = run_editor_probe("import", installed_artifacts, locked_profile, case)
     batches = (project / "twst_405.txt").read_bytes().rstrip().split(b"\r\n\r\n")
     assert len(batches) == len(case)
     for batch, ref in zip(batches, case, strict=True):
@@ -1262,12 +1268,53 @@ def test_real_three_reference_import(installed_artifacts, locked_profile, case):
         assert bytes(value - ord("0") for value in b"".join(rows)) == ref.native_pixels
 
 
+@pytest.mark.skipif(os.environ.get("DMD_EDITOR_SAVE_PROBE") != "1",
+                    reason="explicit real-editor shared-mask save probe")
+def test_real_shared_mask_save(installed_artifacts, locked_profile, case):
+    project, diagnostics = run_editor_probe("save", installed_artifacts, locked_profile, case)
+    for ordinal in (1, 2):
+        assert f"current {ordinal} / 1 selected / 3 total" in diagnostics["selected_frames"][ordinal - 1]
+    saved = (project / "twst_405.cROM").read_bytes()
+    # Save_cRom in the pinned editor writes nine UINTs, a UINT16 and a BOOL after the ROM name.
+    header = struct.Struct("<9IHI")
+    assert header.unpack_from(saved, 64) == (80, 128, 32, 256, 64, 3, 4, 1, 0, 0, 0)
+    offset = 64 + header.size + 3 * 4  # one UINT32 hash for each frame
+    assert saved[offset:offset + 3] == bytes(3)  # shape mode is off
+    assert saved[offset + 3:offset + 6] == bytes((0, 0, 255))
+    assert saved[offset + 6:offset + 6 + 4096] == case[0].ignore_bitmap
+    assert all((project / f"twst_405.{ext}").stat().st_size for ext in ("cRP", "cRZ"))
+
+
+def test_generated_roundtrip_golden(case):
+    root = Path(__file__).resolve().parents[1] / "fixtures" / "editor_roundtrip" / "golden"
+    evidence = json.loads((root / "references.json").read_bytes())
+    for entry in evidence["files"]:
+        data = (root / entry["path"]).read_bytes()
+        assert hashlib.sha256(data).hexdigest() == entry["sha256"]
+        assert len(data) == entry["size"]
+    crom = (root / "twst_405.cROM").read_bytes()
+    assert struct.unpack_from("<9IHI", crom, 64) == (80, 128, 32, 256, 64, 3, 4, 1, 0, 0, 0)
+    assert crom[118:124] == bytes((0, 0, 0, 0, 0, 255))
+    assert crom[124:4220] == case[0].ignore_bitmap == case[1].ignore_bitmap
+    crp = (root / "twst_405.cRP").read_bytes()
+    for ordinal, (ref, entry) in enumerate(zip(case, evidence["references"], strict=True)):
+        source = crp[64 + ordinal * 4096:64 + (ordinal + 1) * 4096]
+        assert source == ref.native_pixels
+        assert (entry["id"], entry["ordinal"], entry["source_sha256"], entry["slot"]) == (
+            ref.id, ordinal, hashlib.sha256(source).hexdigest(), crom[121 + ordinal])
+    with zipfile.ZipFile(root / evidence["runtime_export"]) as package:
+        assert package.namelist() == ["twst_405.cRom"]
+        assert package.read("twst_405.cRom") == crom
+
+
 @pytest.mark.skipif(os.environ.get("DMD_EDITOR_ROUNDTRIP") != "1",
                     reason="set DMD_EDITOR_ROUNDTRIP=1 to require the original-editor round trip")
-def test_original_editor_roundtrip(installed_artifacts, case, locked_profile, tmp_path):
+def test_original_editor_roundtrip(installed_artifacts, case, locked_profile):
     source, decoder = installed_artifacts
-    stage = stage_editor(source, tmp_path / "stage", locked_profile, decoder_path=decoder)
-    result = write_project(tmp_path / "project", case, locked_profile, editor_root=stage)
+    repo = Path(__file__).resolve().parents[2]
+    run = repo / "artifacts" / f"roundtrip-{uuid.uuid4().hex[:12]}"
+    stage = stage_editor(source, run / "editor", locked_profile, decoder_path=decoder)
+    result = write_project(run / "project", case, locked_profile, editor_root=stage, roundtrip=True)
     manifest = json.loads(result.manifest_path.read_bytes())
     reopened = manifest["references"]
     assert [r["id"] for r in reopened] == ["A", "B", "C"]
@@ -1276,3 +1323,12 @@ def test_original_editor_roundtrip(installed_artifacts, case, locked_profile, tm
     assert reopened[0]["slot"] == reopened[1]["slot"] != reopened[2]["slot"]
     assert reopened[2]["slot"] == manifest["unmasked_sentinel"]
     assert result.runtime_export.is_file()
+    diagnostics = result.observations
+    assert diagnostics["editor_pid"] != diagnostics["reopen"]["editor_pid"]
+    for session in (diagnostics, diagnostics["reopen"]):
+        assert session["editor_exited"] and session["job_active_processes"] == 0
+    assert not Path(diagnostics["registry_transaction"]["marker_path"]).exists()
+    assert diagnostics["decoder_loaded_export"] and diagnostics["reopen"]["fresh_save_and_export"]
+    assert "3 total" in diagnostics["reopen"]["reopened_title"]
+    assert all(not item["shape"] for item in reopened)
+    assert reopened[0]["ignore_sha256"] == reopened[1]["ignore_sha256"] == hashlib.sha256(case[0].ignore_bitmap).hexdigest()
