@@ -17,3 +17,8 @@ target_compile_features(editor_bridge PRIVATE cxx_std_20)
 target_compile_options(editor_bridge PRIVATE /W4 /EHsc /utf-8)
 target_link_libraries(editor_bridge PRIVATE windowsapp advapi32 user32)
 set_target_properties(editor_bridge PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}>")
+
+add_executable(serum_worker serum_worker.cpp)
+target_compile_features(serum_worker PRIVATE cxx_std_17)
+target_compile_options(serum_worker PRIVATE /EHsc /utf-8)
+set_target_properties(serum_worker PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}>")
