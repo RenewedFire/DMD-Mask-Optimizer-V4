@@ -53,6 +53,12 @@ def case(tmp_path, monkeypatch):
                       release_archive_sha256='f' * 64,
                       verification_scope='authoring' if name in {'ColorizingDMD editor', 'bundled decoder'} else 'local-runtime')
     decoder = profile['components']['bundled decoder']
+    texture = toolchain / 'editor/textures/chiffres.raw'
+    texture.parent.mkdir()
+    texture.write_bytes(b'synthetic texture')
+    profile['components']['ColorizingDMD editor']['startup_assets']['textures/chiffres.raw'] = {
+        'sha256': sha256(texture), 'size': texture.stat().st_size,
+    }
     decoder['file_version'] = '2.1.0.0'
     for name, dependency in [('ColorizingDMD editor', 'editor/LiteZip.dll'), ('PinMAME 3.6', 'pinmame/Bass64.dll')]:
         target = toolchain / dependency
@@ -94,6 +100,26 @@ def test_profile(case):
     assert locked.local_runtime_verified
     assert not locked.native_binaries_verified
     assert locked.profile_sha256 == module.lock_profile(rom, dump, toolchain).profile_sha256
+
+
+def test_profile_exposes_strict_dump_format(case):
+    rom, dump, toolchain, _, _ = case
+    locked = module.lock_profile(rom, dump, toolchain)
+    assert locked.dump_format == {
+        'grammar': 'timestamped-text-v1',
+        'tick_bits': 32,
+        'tick_unit': None,
+        'discontinuity_policy': 'split-unknown',
+        'timing_evidence': [],
+    }
+
+
+def test_rejects_unhashable_dump_tick_unit(case):
+    _, _, _, profile, save_profile = case
+    profile['dump_format']['tick_unit'] = []
+    save_profile()
+    with pytest.raises(module.ProfileError, match='dump_format.*tick_unit'):
+        module.inspect_fixtures(*case[:2])
 
 
 @pytest.mark.parametrize(('index', 'component'), [(0, 'ROM'), (1, 'dump')])
@@ -164,6 +190,7 @@ def test_rejects_empty_component_record(case):
     ('dependencies', {}),
     ('pending', 'not a list'), ('release_archive_sha256', None), ('sha256', None), ('sha256', 'a' * 63),
     ('source_commit', '3721691'), ('source_commit', 'g' * 40),
+    ('startup_asset_source', r'C:\Other\ColorizingDMD'),
 ])
 def test_names_invalid_native_fields(case, field, value):
     _, _, _, profile, save_profile = case
@@ -207,7 +234,6 @@ def test_rejects_decoder_source_from_another_commit(case):
 def test_decoder_version_mismatch_remains_unavailable_without_pending_notice(case):
     _, _, _, profile, save_profile = case
     profile['components']['bundled decoder']['source_version'] = '2.2.0'
-    assert profile['components']['bundled decoder']['provenance']['kind'] == 'source-tree'
     save_profile()
     with pytest.raises(module.ProfileError, match='bundled decoder.*source_version.*source_tree_binary_version'):
         module.lock_profile(*case[:3])

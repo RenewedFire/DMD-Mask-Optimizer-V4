@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Original ColorizingDMD editor bridge protocol v1",
+  "oneOf": [{ "$ref": "#/$defs/request" }, { "$ref": "#/$defs/response" }],
+  "$defs": {
+    "sha256": { "type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[a-f0-9]{64}$" },
+    "path": { "type": "string", "minLength": 1 },
+    "id": { "type": "string", "pattern": "\\S" },
+    "nativePixels": {
+      "description": "Row-major native shade indices. The request profile determines dimensions and shade count.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "integer", "minimum": 0, "maximum": 255 }
+    },
+    "ignoreBitmap": {
+      "description": "Row-major bitmap of the same dimensions as the source. One means ignore.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "integer", "enum": [0, 1] }
+    },
+    "inputReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "native_pixels", "source_sha256", "ignore_bitmap", "ignore_sha256", "shape"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "native_pixels": { "$ref": "#/$defs/nativePixels" },
+        "source_sha256": { "$ref": "#/$defs/sha256" },
+        "ignore_bitmap": { "oneOf": [{ "$ref": "#/$defs/ignoreBitmap" }, { "type": "null" }] },
+        "ignore_sha256": { "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
+        "shape": { "const": false }
+      },
+      "if": { "properties": { "ignore_bitmap": { "type": "null" } } },
+      "then": { "properties": { "ignore_sha256": { "type": "null" } } },
+      "else": { "properties": { "ignore_sha256": { "type": "string" } } }
+    },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "editor_root", "expected_decoder_sha256", "project_root", "config_root",
+        "deadline_ms", "width", "height", "native_shades"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "editor_root": { "$ref": "#/$defs/path", "description": "Absolute path to the isolated, verified editor tree." },
+        "expected_decoder_sha256": { "const": "b39a1ef00f4f4c68c73d2b3ffe26521a6f95af16d44b3bcf2e2d2560d65bcdcd" },
+        "project_root": { "$ref": "#/$defs/path", "description": "Absolute path to the generated project directory." },
+        "config_root": { "$ref": "#/$defs/path", "description": "Absolute path to the isolated editor configuration and autosave directory." },
+        "deadline_ms": { "type": "integer", "minimum": 1 },
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 },
+        "native_shades": { "type": "integer", "minimum": 1, "maximum": 256 },
+        "references": {
+          "description": "Input order is significant. IDs must be unique.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/inputReference" }
+        },
+        "dump_path": { "$ref": "#/$defs/path", "description": "Immutable native TXT dump supplied directly to ColorizingDMD." },
+        "dump_sha256": { "$ref": "#/$defs/sha256" },
+        "expected_import_count": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      },
+      "oneOf": [
+        {
+          "required": ["references"],
+          "not": { "anyOf": [{ "required": ["dump_path"] }, { "required": ["dump_sha256"] }, { "required": ["expected_import_count"] }] }
+        },
+        {
+          "required": ["dump_path", "dump_sha256", "expected_import_count"],
+          "not": { "required": ["references"] }
+        }
+      ]
+    },
+    "companionFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "size", "header"],
+      "properties": {
+        "path": { "$ref": "#/$defs/path", "description": "Path relative to project_root." },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size": { "type": "integer", "minimum": 0 },
+        "header": { "type": "object" }
+      }
+    },
+    "reopenedReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "ordinal", "native_pixels", "source_sha256", "ignore_sha256", "shape", "slot"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "ordinal": { "type": "integer", "minimum": 0 },
+        "native_pixels": { "$ref": "#/$defs/nativePixels" },
+        "source_sha256": { "$ref": "#/$defs/sha256" },
+        "ignore_sha256": { "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
+        "shape": { "type": "boolean" },
+        "slot": { "type": "integer", "minimum": 0, "maximum": 255 }
+      }
+    },
+    "response": {
+      "oneOf": [{ "$ref": "#/$defs/success" }, { "$ref": "#/$defs/failure" }]
+    },
+    "success": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "status", "files", "references", "custom_mask_count", "unmasked_sentinel",
+        "sidecar_path", "runtime_export", "observations"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "status": { "const": "ok" },
+        "files": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/companionFile" } },
+        "references": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/reopenedReference" } },
+        "custom_mask_count": { "type": "integer", "minimum": 0 },
+        "unmasked_sentinel": { "type": "integer", "minimum": 0, "maximum": 255 },
+        "sidecar_path": {
+          "description": "Path relative to project_root for the input-ID mapping, or null if IDs persist in the editor.",
+          "oneOf": [{ "$ref": "#/$defs/path" }, { "type": "null" }]
+        },
+        "runtime_export": {
+          "description": "Export path relative to project_root, if an export was produced.",
+          "oneOf": [{ "$ref": "#/$defs/path" }, { "type": "null" }]
+        },
+        "observations": { "type": "object" }
+      }
+    },
+    "failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "status", "stage", "message", "diagnostics"],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "status": { "const": "error" },
+        "stage": { "type": "string", "minLength": 1 },
+        "message": { "type": "string", "minLength": 1 },
+        "diagnostics": { "type": "object" }
+      }
+    }
+  }
+}

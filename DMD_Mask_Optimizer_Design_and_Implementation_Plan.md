@@ -336,7 +336,7 @@ Use existing libdmdutil playback and JSON comparison capabilities where a pinned
 
 Select and pin a compatible build from the original SerumColor ColorizingDMD line. Resolve source and binary checksums, then prove a minimal project can be created, opened, saved, exported, and replayed. The exact version and runtime pairing are implementation decisions delegated by the user. They remain technically unverified at this planning revision.
 
-Use the editor's actual data model and serializer through a small integration bridge where feasible. A standalone project writer is acceptable after round-trip fixtures establish the required schema and metadata. The desktop workflow must generate the project automatically.
+Use the editor's actual data model and serializer through a small integration bridge where feasible. A standalone project writer is acceptable after round-trip fixtures establish the required schema and metadata. For the fixed Twister build, the bridge may launch an isolated staged editor and select the original locked TXT through ColorizingDMD's native importer, but it is never a dump-data transport or project writer: it receives only the original path, source digest, and expected imported-frame count. It must never reconstruct frames, synthesize timestamps, or pass masks/pixels through JSON.
 
 Create a new authoring project from the ROM identity, reference frames, comparison masks, frame assignments, source sequence information, and required default authoring metadata. Use the selected original editor's real companion-file conventions.
 
@@ -413,7 +413,7 @@ Measure match latency, end-to-end runtime processing latency, peak memory, resul
 | Sharing | Valid shared mask, invalid union, pairwise-compatible group with an invalid larger union |
 | Solver | Tiny exhaustive cases, locked variables, unmasked baseline, infeasibility, timeout |
 | Runtime state | Previous-match dependence, repeated frames, reset, transitions |
-| Editor | Automatic new-project creation, reopen/save/export, correct IDs, preserved source data |
+| Editor | Synthetic compatibility-fixture creation, reopen/save/export, correct IDs, preserved source data; never automate fixed-dump import |
 | Time and recovery | Deadline during exploration/solve/verification, cancellation, worker crash, resume, late new frames |
 | Scale | Streaming input, bounded cache, large result bundle, UI responsiveness |
 
@@ -421,7 +421,7 @@ Use small synthetic instances with complete mask enumeration to verify the optim
 
 Test the normal desktop entry point without requiring a user to review family groupings or edit intermediate files. An uncertain grouping must not stop unrelated analysis or prevent a valid provisional export.
 
-A release passes when it can process user-selected supported ROMs, run automatic exploration/inference/optimization within the configurable budget, export a valid editable original-ColorizingDMD project and separate files, and report coverage honestly.
+A release passes when it can process user-selected supported ROMs, run automatic exploration/inference/optimization within the configurable budget, export reconciled companion files for a user-created original-ColorizingDMD project, and report coverage honestly. Fixed-dump import remains native user authoring work.
 
 Every exported verified scope must have zero unexplained incorrect-family matches in its complete verification corpus/domain. Frames outside that scope must be identified as pending, unsupported, or uncovered. A full-ROM claim requires the complete proof obligations described in Section 18.
 
@@ -524,7 +524,7 @@ The first supported profile is fixed to the locally supplied *Twister* 4.05 fixt
 | Grouping policy | Generalize only established numeric/text domains backed by renderer or domain evidence; keep observed-only and uncertain changes as separate references | No confidence threshold may silently convert an uncertain group into a generalized one. |
 | Solver policy | Use strict-discrimination candidate-pool optimization with CP-SAT for the MVP | Report its bound only for the generated candidate pool and policy. Direct all-mask synthesis is deferred enhancement work. |
 | Coverage claim | The 30-minute default run verifies and exports its captured scope only | Full-ROM coverage requires a separate reachability proof; observed saturation is never reported as complete coverage. |
-| Support expansion | Add a driver/geometry profile only after the same ROM audit, raw-byte capture parity, native matching, editor round-trip, and replay fixture suite passes | The application accepts selected ROMs at runtime but reports unsupported profiles honestly. |
+| Support expansion | Add a driver/geometry profile only after the same ROM audit, raw-byte capture parity, native matching, synthetic editor round-trip, and replay fixture suite passes | The application accepts selected ROMs at runtime but reports unsupported profiles honestly. |
 
 The former pending items are therefore executable completion criteria: byte-level capture parity, ordered matching parity, editor project round trip, inference accuracy, measured performance, and support-matrix expansion. They cannot truthfully be pre-declared as passing; M0-M8 must produce their recorded evidence before a release claim.
 

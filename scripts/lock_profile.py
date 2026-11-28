@@ -12,6 +12,7 @@ from pathlib import Path
 
 
 PROFILE_PATH = Path(__file__).resolve().parents[1] / "profiles" / "twst_405.json"
+STARTUP_ASSET_SOURCE = r"C:\DMD Colorization\ColorizingDMD"
 PE_ARCHITECTURES = {0x014C: "x86", 0x8664: "x64", 0xAA64: "arm64"}
 REQUIRED_COMPONENTS = ("ColorizingDMD editor", "bundled decoder", "PinMAME 3.6", "local Serum runtime")
 
@@ -39,6 +40,7 @@ class Profile:
     delivery_semantics: str | None
     rom_sha256: str
     dump_sha256: str
+    dump_format: dict[str, object]
     rom_members: tuple[RomMember, ...]
     components: dict[str, dict]
     profile_sha256: str
@@ -149,6 +151,17 @@ def _validate_component(name, record):
     if not isinstance(record, dict):
         raise ProfileError(f"{name}: invalid component record; expected an object")
     _field(record, "binary", _toolchain_path, "a relative toolchain path", name)
+    if name == "ColorizingDMD editor":
+        _field(record, "startup_asset_source",
+               lambda value: isinstance(value, str) and value.casefold() == STARTUP_ASSET_SOURCE.casefold(),
+               STARTUP_ASSET_SOURCE, name)
+        assets = _field(record, "startup_assets", lambda value: isinstance(value, dict)
+                        and "textures/chiffres.raw" in value, "the required editor startup asset locks", name)
+        for path, lock in assets.items():
+            if not _toolchain_path(path) or not isinstance(lock, dict):
+                raise ProfileError(f"{name}: invalid startup asset {path!r}")
+            _field(lock, "sha256", lambda value: _hex(value, 64), "a lowercase SHA-256 digest", path)
+            _field(lock, "size", lambda value: type(value) is int and value >= 0, "a byte count", path)
     _field(record, "sha256", lambda value: _hex(value, 64), "a lowercase SHA-256 digest", name)
     _field(record, "architecture", lambda value: isinstance(value, str) and value in PE_ARCHITECTURES.values(),
            "x86, x64 or arm64", name)
@@ -202,6 +215,12 @@ def _validate_profile(record):
            "a nonempty string or null", name)
     for field in ("rom_sha256", "dump_sha256"):
         _field(record, field, lambda value: _hex(value, 64), "a lowercase SHA-256 digest", name)
+    dump_format = _field(record, "dump_format", lambda value: isinstance(value, dict), "an object", name)
+    _field(dump_format, "grammar", lambda value: value == "timestamped-text-v1", "timestamped-text-v1", "dump_format")
+    _field(dump_format, "tick_bits", lambda value: value == 32, "32", "dump_format")
+    _field(dump_format, "tick_unit", lambda value: value is None or value == "milliseconds", "null or milliseconds", "dump_format")
+    _field(dump_format, "discontinuity_policy", lambda value: value == "split-unknown", "split-unknown", "dump_format")
+    _field(dump_format, "timing_evidence", _string_list, "a list of nonempty strings", "dump_format")
     _field(record, "rom_members", lambda value: isinstance(value, list) and bool(value),
            "a nonempty list of ROM members", name)
 
@@ -220,7 +239,7 @@ def _validate_profile(record):
             raise ProfileError(f"{name}: {field} differs from ColorizingDMD editor")
     source_version = _field(decoder, "source_version", _nonempty_string, "a nonempty string", name)
     source_tree_version = _field(decoder, "source_tree_binary_version", _nonempty_string, "a nonempty string", name)
-    if decoder.get("provenance", {}).get("kind") == "source-tree" and source_version != source_tree_version:
+    if source_version != source_tree_version:
         raise ProfileError(f"{name}: source_version {source_version} differs from source_tree_binary_version {source_tree_version}")
 
 
@@ -271,7 +290,7 @@ def inspect_fixtures(rom: Path, dump: Path) -> Profile:
         width=record["width"],
         height=record["height"], native_shades=record["native_shades"],
         delivery_semantics=record["delivery_semantics"], rom_sha256=rom_sha256,
-        dump_sha256=dump_sha256, rom_members=members, components=record["components"],
+        dump_sha256=dump_sha256, dump_format=record["dump_format"], rom_members=members, components=record["components"],
         profile_sha256=digest,
     )
 
@@ -327,8 +346,16 @@ def _verify_component(name, component, toolchain):
     for relative_path, lock in component["dependencies"].items():
         dependency = lock if isinstance(lock, dict) else {"sha256": lock}
         _verify_binary(toolchain / relative_path, dependency, f"{name} dependency {relative_path}")
+    for relative, lock in component.get("startup_assets", {}).items():
+        _verify_asset((toolchain / component["binary"]).parent / relative, lock, relative)
     if component["pending"]:
         raise ProfileError(f"{name}: missing provenance: {', '.join(component['pending'])}")
+
+
+def _verify_asset(path, lock, name):
+    _check_sha256(path, lock["sha256"], name)
+    if path.stat().st_size != lock["size"]:
+        raise ProfileError(f"{name}: size mismatch for {path}; expected {lock['size']} bytes")
 
 
 def lock_profile(rom: Path, dump: Path, toolchain: Path, scope="local-runtime") -> Profile:

@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "files": [
+    {
+      "path": "twst_405.cROM",
+      "sha256": "d020f1e55a9b1d356c039b8035d42456eaf22c3cfcb576849cf8a864f38e996a",
+      "size": 256052,
+      "header": {
+        "prefix_hex": "747773745f3430350000000000000000"
+      }
+    },
+    {
+      "path": "twst_405.cRP",
+      "sha256": "55fc06c36a869c4b18472db3336fc5b681e5074c33b5d23a7d2ae801b8a3ea7e",
+      "size": 135003,
+      "header": {
+        "prefix_hex": "747773745f3430350000000000000000"
+      }
+    },
+    {
+      "path": "twst_405.cRZ",
+      "sha256": "06c2c489aae7d55fec68e1648b88192c842d3ac30bd114201487c48d49df5271",
+      "size": 565,
+      "header": {
+        "prefix_hex": "504b03041400020008002800795d21a7"
+      }
+    }
+  ],
+  "custom_mask_count": 1,
+  "unmasked_sentinel": 255,
+  "runtime_export": "twst_405.cRZ",
+  "references": [
+    {
+      "id": "A",
+      "ordinal": 0,
+      "source_sha256": "638d223b3f122c027c954adb76117cf787b70a1c5a6c67e877fa34902ed03e1f",
+      "ignore_sha256": "842ad368ca8e82ae76c97cb25d23224a5ef2bc380f9f72743e1e3d1f7f020ba7",
+      "shape": false,
+      "slot": 0
+    },
+    {
+      "id": "B",
+      "ordinal": 1,
+      "source_sha256": "78c714ebd954a4e1505ac4f6dbd69b95f1520da8995f2bb6a8c5f98365652672",
+      "ignore_sha256": "842ad368ca8e82ae76c97cb25d23224a5ef2bc380f9f72743e1e3d1f7f020ba7",
+      "shape": false,
+      "slot": 0
+    },
+    {
+      "id": "C",
+      "ordinal": 2,
+      "source_sha256": "297ff8e807eec113914f3eb9a1a26e5e4267eab4a750c876b8d32046f0e69aed",
+      "ignore_sha256": null,
+      "shape": false,
+      "slot": 255
+    }
+  ]
+}

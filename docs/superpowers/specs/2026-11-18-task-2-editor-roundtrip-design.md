@@ -50,6 +50,48 @@ use them read-only as format witnesses.
 
 ## Design
 
+### Isolation amendment — 2026-11-19
+
+The user approved a transactional backup-and-restore of the current user's
+`HKCU\SOFTWARE\ColorizingDMD` registry subtree for each real-editor run. This
+is necessary because the pinned editor loads its configured paths from that
+subtree and does not offer a command-line configuration-root override.
+
+Before launching the staged editor, the bridge must export or enumerate the
+subtree into a run-local, ignored artifact and record whether it existed. It
+then writes only the minimal temporary values that direct the editor to the
+generated project and configuration directories. In a `finally`-equivalent
+cleanup path it must restore every prior value and delete the subtree if it
+did not exist before the run. It must verify that restored values and value
+types equal the snapshot. If preparation or restoration fails, the bridge
+must fail closed, preserve diagnostics, and never claim a round trip.
+
+The bridge requires exclusive ColorizingDMD use: it must refuse to start if a
+ColorizingDMD process is already running and hold a run-local lock while the
+temporary registry state exists. A crash or forced termination can prevent
+immediate cleanup, so the snapshot includes an incomplete-run marker and is
+retained in the generated artifact directory. Before a later bridge run, the
+adapter detects that marker, restores the snapshot, verifies it, and only then
+permits a new editor launch. The first post-crash invocation reports that
+recovery occurred; it never overwrites a snapshot from another active run.
+
+Reopened editable project data is the authority for reference-pixel, mask,
+order, and sidecar assertions. Runtime export verification for this task is
+limited to a sandboxed export being produced and accepted by the pinned
+decoder; it does not attempt to infer editor-reference semantics from runtime
+bytes. The bridge supports the defined three-reference fixture and the
+separate 64/65 mask-boundary probe; general interactive project authoring is
+out of scope.
+
+The second user-provided installation at
+`C:\DMD Colorization\ColorizingDMD` is a read-only staging source. Its
+`ColorizingDMD.exe` matches the locked editor digest and it supplies required
+startup assets, including `textures\chiffres.raw`. Startup assets become
+profile-declared, hash-verified stage inputs. The staged decoder remains the
+separately pinned source-tree Serum 2.1.0 DLL with SHA-256
+`da71fa73e838ab3e257a2a73c8f74d88a3336615930761fa494a251822e0c2d5`; an
+adjacent source DLL is never trusted merely because it is present.
+
 `native/editor_bridge.cpp` is a narrow Windows x64 executable. Before every
 run, it stages an isolated editor tree that contains the pinned
 `ColorizingDMD.exe` plus the exact source-tree decoder DLL locked by Task 1
@@ -69,6 +111,10 @@ project.
 `Reference`, `ProjectFiles`, and `write_project(folder, refs, profile)`. It
 validates Task 1 geometry/shades, serializes the bridge request, records the
 bridge manifest, and offers reopen/export inspection used by integration tests.
+
+This bridge is limited to the synthetic Task 2 fixture. It must not import the
+fixed Twister dump, generate a substitute dump, or become part of the normal
+ColorizingDMD authoring workflow.
 
 The bridge test fixture has exactly three distinct 128×32 row-major native
 pixel frames with shades 0–3. `Reference` IDs are unique and nonempty; their

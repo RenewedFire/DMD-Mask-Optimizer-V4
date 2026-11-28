@@ -10,6 +10,15 @@
 
 **Spec:** `DMD_Mask_Optimizer_Design_and_Implementation_Plan.md`, matching and compatibility requirements; `docs/superpowers/plans/2026-11-18-dmd-mask-optimizer.md`, Task 3.
 
+## Execution result — 2026-11-24
+
+Completed. The editor-installed Serum 2.3.1 DLL (SHA-256
+`b39a1ef00f4f4c68c73d2b3ffe26521a6f95af16d44b3bcf2e2d2560d65bcdcd`)
+recognizes the untouched Task 2 export, including the expected three RGB565
+outputs. The obsolete 2.1.0 source-tree DLL lock was replaced with the verified
+local installed lock; the production path continues to stage exact manifest
+bytes. The final suite result was `119 passed, 17 skipped in 28.46s`.
+
 ## Current checkpoint — do not reimplement
 
 Commit `e967718` already provides `native/serum_worker.cpp`, `src/dmd_optimizer/verify/oracle.py`, `schemas/worker-v1.json`, and `tests/integration/test_oracle.py`. Nine focused oracle tests passed with the pinned decoder. The evidence is in `docs/superpowers/evidence/task-3-native-oracle.md`.
