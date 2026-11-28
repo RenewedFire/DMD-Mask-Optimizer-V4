@@ -2,12 +2,15 @@
 namespace editor_import {
 
 fs::path write_dump(fs::path const& project, JsonArray const& references) {
-    if (references.Size() != 3) throw std::runtime_error("import probe requires three references");
+    if (!references.Size() || references.Size() > 65535)
+        throw std::runtime_error("import requires 1 through 65535 references");
     std::string text;
     for (unsigned i = 0; i < references.Size(); ++i) {
         auto pixels = references.GetObjectAt(i).GetNamedArray(L"native_pixels");
         if (pixels.Size() != 128 * 32) throw std::runtime_error("expected 128x32 import pixels");
-        text += std::array{"0x00000000", "0x00000064", "0x000000C8"}[i];
+        char timestamp[11]{};
+        std::snprintf(timestamp, sizeof(timestamp), "0x%08X", static_cast<unsigned>(i * 100));
+        text += timestamp;
         text += "\r\n";
         for (unsigned j = 0; j < pixels.Size(); ++j) {
             auto shade = pixels.GetNumberAt(j);
@@ -95,7 +98,7 @@ void submit_file(DWORD pid, wchar_t const* title, fs::path const& path, ULONGLON
     click(GetDlgItem(dialog, IDOK));
 }
 
-void operate(DWORD pid, fs::path const& dump, ULONGLONG deadline, JsonObject const& evidence) {
+void operate(DWORD pid, fs::path const& dump, unsigned expected_references, ULONGLONG deadline, JsonObject const& evidence) {
     auto main = wait(deadline, "main editor", [&] { return find(pid, nullptr, L"ColorizingDMD"); });
     click(wait(deadline, "New toolbar button", [&] { return find(pid, main, L"Button", 1001); }));
     submit_file(pid, L"Choose the initial TXT file", dump, deadline);
@@ -105,11 +108,11 @@ void operate(DWORD pid, fs::path const& dump, ULONGLONG deadline, JsonObject con
             throw std::runtime_error("editor import filters would discard generated frames");
     click(GetDlgItem(filters, IDOK));
     wchar_t caption[512]{};
-    wait(deadline, "twst_405 with three frames", [&]() -> HWND {
+    wait(deadline, "twst_405 imported frames", [&]() -> HWND {
         GetWindowTextW(main, caption, 512);
         std::wstring_view title(caption);
-        return title.find(L"ROM name: twst_405 ") != title.npos &&
-            title.find(L"current 0 / 1 selected / 3 total") != title.npos ? main : nullptr;
+        auto expected = L"current 0 / 1 selected / " + std::to_wstring(expected_references) + L" total";
+        return title.find(L"ROM name: twst_405 ") != title.npos && title.find(expected) != title.npos ? main : nullptr;
     });
     evidence.Insert(L"imported_title", JsonValue::CreateStringValue(caption));
 }

@@ -149,6 +149,17 @@ void apply_fixture_mask(DWORD pid, ULONGLONG deadline, JsonObject const& evidenc
 constexpr std::array project_names{L"twst_405.cROM", L"twst_405.cRP", L"twst_405.cRZ"};
 using SaveTimes = std::array<fs::file_time_type, project_names.size()>;
 
+SaveTimes existing_save_times(fs::path const& project) {
+    SaveTimes times;
+    for (size_t i = 0; i < times.size(); ++i) {
+        auto path = project / project_names[i];
+        if (!fs::is_regular_file(path) || !fs::file_size(path))
+            throw std::runtime_error("saved direct-dump project is incomplete");
+        times[i] = fs::last_write_time(path);
+    }
+    return times;
+}
+
 SaveTimes wait_for_save(HWND main, fs::path const& project, ULONGLONG deadline, SaveTimes const* previous = nullptr) {
     SaveTimes times;
     wait(deadline, "three completed editor output files", [&]() -> HWND {
@@ -183,14 +194,15 @@ SaveTimes first_save(DWORD pid, fs::path const& project, ULONGLONG deadline) {
     return wait_for_save(main, project, deadline);
 }
 
-void reopen_and_export(DWORD pid, fs::path const& project, ULONGLONG deadline,
+void reopen_and_export(DWORD pid, fs::path const& project, unsigned expected_frames, ULONGLONG deadline,
                        SaveTimes const& previous, JsonObject const& evidence) {
     auto main = wait(deadline, "fresh editor window", [&] { return find(pid, nullptr, L"ColorizingDMD"); });
     click(find(pid, main, L"Button", 1003));
     submit_file(pid, L"Choose the project file", project / project_names[0], deadline);
-    wait(deadline, "reopened three-reference project", [&]() -> HWND {
+    wait(deadline, "reopened direct-dump project", [&]() -> HWND {
         auto title = caption(main);
-        return title.find(L"ROM name: twst_405 ") != title.npos && title.find(L"/ 3 total") != title.npos ? main : nullptr;
+        auto expected = L"/ " + std::to_wstring(expected_frames) + L" total";
+        return title.find(L"ROM name: twst_405 ") != title.npos && title.find(expected) != title.npos ? main : nullptr;
     });
     evidence.Insert(L"reopened_title", JsonValue::CreateStringValue(caption(main)));
     click(find(pid, main, L"Button", 1004));
@@ -308,6 +320,39 @@ JsonObject inspect_project(fs::path const& editor, fs::path const& project, fs::
     result.Insert(L"sidecar_path", JsonValue::CreateStringValue(L"roundtrip.json"));
     result.Insert(L"observations", diagnostics);
     write_new_json(project / L"roundtrip.json", result);
+    return result;
+}
+
+JsonObject inspect_direct_project(fs::path const& editor, fs::path const& project, fs::path const& config,
+                                  unsigned expected_frames, JsonObject const& diagnostics) {
+    constexpr size_t header_end = 106;
+    auto crom = read_prefix(project / project_names[0], header_end);
+    auto crp = read_prefix(project / project_names[1], 64);
+    std::array<UINT32, 9> expected{80, 128, 32, 256, 64, expected_frames, 4, 0, 0};
+    if (std::memcmp(crom.data(), "twst_405", 9) || std::memcmp(crp.data(), "twst_405", 9) ||
+        std::memcmp(crom.data() + 64, expected.data(), sizeof(expected)) ||
+        !std::all_of(crom.begin() + 100, crom.end(), [](BYTE v) { return v == 0; }))
+        throw std::runtime_error("saved direct-dump project header differs from its locked import");
+    JsonArray files;
+    for (auto name : project_names) {
+        auto path = project / name;
+        JsonObject entry;
+        entry.Insert(L"path", JsonValue::CreateStringValue(name));
+        entry.Insert(L"sha256", JsonValue::CreateStringValue(file_hash(path)));
+        entry.Insert(L"size", JsonValue::CreateNumberValue(static_cast<double>(fs::file_size(path))));
+        files.Append(entry);
+    }
+    verify_decoder(editor, config, project / project_names[2]);
+    diagnostics.Insert(L"decoder_loaded_export", JsonValue::CreateBooleanValue(true));
+    JsonObject result;
+    result.Insert(L"schema_version", JsonValue::CreateNumberValue(1));
+    result.Insert(L"status", JsonValue::CreateStringValue(L"ok"));
+    result.Insert(L"files", files);
+    result.Insert(L"imported_frame_count", JsonValue::CreateNumberValue(expected_frames));
+    result.Insert(L"runtime_export", JsonValue::CreateStringValue(project_names[2]));
+    result.Insert(L"sidecar_path", JsonValue::CreateStringValue(L"roundtrip-direct.json"));
+    result.Insert(L"observations", diagnostics);
+    write_new_json(project / L"roundtrip-direct.json", result);
     return result;
 }
 

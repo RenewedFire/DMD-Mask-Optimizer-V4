@@ -1,4 +1,4 @@
-// Windows x64 host of the pinned Serum 2.1.0 public C ABI. One load per process.
+// Windows x64 host of the pinned Serum 2.3.1 public C ABI. One load per process.
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -67,7 +67,7 @@ int wmain(int argc, wchar_t** argv) {
     auto dispose = symbol<void (*)()>(dll, "Serum_Dispose");
     auto colorize = symbol<Dword (*)(Byte*)>(dll, "Serum_Colorize");
     auto rotate = symbol<Dword (*)()>(dll, "Serum_Rotate");
-    if (!version || !load || !dispose || !colorize || !rotate || strcmp(version(), "2.1.0")) return 3;
+    if (!version || !load || !dispose || !colorize || !rotate || strcmp(version(), "2.3.1")) return 3;
     auto root = std::filesystem::path(argv[2]).string();
     // The editor requests both resolutions. Rotate also visits its 64p buffers.
     auto* state = load(root.c_str(), "twst_405", 3);

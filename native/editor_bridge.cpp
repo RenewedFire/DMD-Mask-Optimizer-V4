@@ -32,16 +32,16 @@ using Windows::Security::Cryptography::CryptographicBuffer;
 using Windows::Security::Cryptography::Core::HashAlgorithmProvider;
 
 static_assert(sizeof(void*) == 8, "The editor bridge must be built for x64");
-constexpr wchar_t decoder_hash[] = L"da71fa73e838ab3e257a2a73c8f74d88a3336615930761fa494a251822e0c2d5";
+constexpr wchar_t decoder_hash[] = L"b39a1ef00f4f4c68c73d2b3ffe26521a6f95af16d44b3bcf2e2d2560d65bcdcd";
 constexpr wchar_t editor_hash[] = L"daf356ffae699ca830d6b2bdc3ffe2791908789f0d5671c2f8f448151b6caaa7";
 
 std::string read_request() {
-    constexpr size_t limit = 16 * 1024 * 1024;
+    constexpr size_t limit = 128 * 1024 * 1024;
     std::string input;
     std::array<char, 8192> block;
     while (std::cin.read(block.data(), block.size()) || std::cin.gcount()) {
         if (input.size() + std::cin.gcount() > limit)
-            throw std::runtime_error("request exceeds 16 MiB");
+            throw std::runtime_error("request exceeds 128 MiB");
         input.append(block.data(), static_cast<size_t>(std::cin.gcount()));
     }
     if (!std::cin.eof() || input.empty()) throw std::runtime_error("cannot read JSON request");
@@ -561,9 +561,10 @@ void verify_launch_inventory(fs::path const& editor) {
     auto data = reinterpret_cast<uint8_t const*>(inventory.data());
     auto buffer = CryptographicBuffer::CreateFromByteArray({data, data + inventory.size()});
     auto digest = HashAlgorithmProvider::OpenAlgorithm(L"SHA256").HashData(buffer);
-    if (CryptographicBuffer::EncodeToHexString(digest) !=
-        L"855eb895f1c3e484bfa31b50f75a6bc0ed1c1806eba4d3c19d445ebb0c35d99f")
-        throw std::runtime_error("staged editor inventory differs from the locked authoring files");
+    auto actual = CryptographicBuffer::EncodeToHexString(digest);
+    if (actual !=
+        L"3f7a69dd492ae10b82a71ad1947adf814dc6a77aeb19348fafaf3b68ba1f51f0")
+        throw std::runtime_error("staged editor inventory differs from the locked authoring files; actual staged editor inventory SHA-256: " + to_string(actual));
 }
 
 struct WindowObservation {
@@ -743,7 +744,7 @@ int finish_roundtrip(HKEY software, fs::path const& journal, std::map<std::wstri
     require_editor_stopped();
     with_journaled_transaction(software, journal, paths, reopened, [&](fs::path const& run) {
         bounded_startup(editor, duration, reopened, run, [&](DWORD pid) {
-            editor_import::reopen_and_export(pid, project, deadline, previous, reopened);
+            editor_import::reopen_and_export(pid, project, 3, deadline, previous, reopened);
         });
     });
     stage = L"roundtrip-validation";
@@ -754,14 +755,24 @@ int finish_roundtrip(HKEY software, fs::path const& journal, std::map<std::wstri
 
 int preflight(JsonObject const& request, JsonObject const& diagnostics, bool launch,
               fs::path const& journal, std::function<HKEY()> const& software, hstring& stage,
-              bool import_probe = false, bool save_probe = false, bool roundtrip = false) {
+              bool import_probe = false, bool save_probe = false, bool roundtrip = false,
+              bool reopen_export_probe = false) {
     if (request.GetNamedNumber(L"schema_version") != 1 ||
         request.GetNamedString(L"expected_decoder_sha256") != decoder_hash)
         throw std::runtime_error("unsupported request version or decoder lock");
     if (request.GetNamedNumber(L"deadline_ms") <= 0 ||
         request.GetNamedNumber(L"width") != 128 || request.GetNamedNumber(L"height") != 32 ||
-        request.GetNamedNumber(L"native_shades") != 4 || !request.GetNamedArray(L"references").Size())
+        request.GetNamedNumber(L"native_shades") != 4)
         throw std::runtime_error("invalid deadline or Twister fixture");
+    auto has_references = request.HasKey(L"references");
+    auto has_dump = request.HasKey(L"dump_path");
+    if (has_references == has_dump)
+        throw std::runtime_error("request must provide exactly one import input");
+    JsonArray references{nullptr};
+    if (has_references) {
+        references = request.GetNamedArray(L"references");
+        if (!references.Size()) throw std::runtime_error("invalid generated import references");
+    }
 
     auto editor = request_path(request, L"editor_root");
     auto project = request_path(request, L"project_root");
@@ -798,8 +809,11 @@ int preflight(JsonObject const& request, JsonObject const& diagnostics, bool lau
     if (!launch) return failure(L"startup-opt-in", L"Explicit startup preflight required", diagnostics);
     stage = L"stage-verification";
     verify_launch_inventory(editor);
-    if (!fs::is_directory(config) || !fs::is_empty(config) || !fs::create_directory(project))
-        throw std::runtime_error("startup preflight requires fresh project and configuration directories");
+    if (!fs::is_directory(config) || !fs::is_empty(config) ||
+        (reopen_export_probe ? !fs::is_directory(project) : !fs::create_directory(project)))
+        throw std::runtime_error(reopen_export_probe
+            ? "reopen/export probe requires an existing project and fresh configuration directory"
+            : "startup preflight requires fresh project and configuration directories");
     // The pinned editor reads these six REG_SZ paths at startup. Its paths
     // use the ANSI Win32 API and require room for the trailing separator/NUL.
     auto dir = config.wstring() + L"\\", projects = project.wstring() + L"\\";
@@ -813,24 +827,52 @@ int preflight(JsonObject const& request, JsonObject const& diagnostics, bool lau
     }
     auto duration = static_cast<DWORD>((std::min)(request.GetNamedNumber(L"deadline_ms"), 5000.0));
     std::function<void(DWORD)> inspect;
-    auto references = request.GetNamedArray(L"references");
     auto deadline = GetTickCount64() +
         static_cast<ULONGLONG>((std::min)(request.GetNamedNumber(L"deadline_ms"), 60000.0));
     editor_import::SaveTimes previous{};
-    if (import_probe || save_probe || roundtrip) {
+    unsigned direct_frame_count{};
+    if (import_probe || save_probe || roundtrip || reopen_export_probe) {
         stage = L"import-input";
-        if (save_probe || roundtrip) editor_import::require_mask_fixture(references);
-        auto input = editor_import::write_dump(project, references);
+        fs::path input;
+        unsigned expected_references{};
+        if (has_dump) {
+            if (!request.HasKey(L"dump_sha256") || !request.HasKey(L"expected_import_count"))
+                throw std::runtime_error("direct dump import requires digest and expected count");
+            input = request_path(request, L"dump_path");
+            if (!fs::is_regular_file(input) || fs::file_size(input) == 0)
+                throw std::runtime_error("direct dump input is missing or empty");
+            if (file_hash(input) != request.GetNamedString(L"dump_sha256"))
+                throw std::runtime_error("direct dump digest does not match request");
+            auto count = request.GetNamedNumber(L"expected_import_count");
+            if (count < 1 || count > 65535 || std::floor(count) != count)
+                throw std::runtime_error("invalid direct dump expected count");
+            expected_references = static_cast<unsigned>(count);
+            direct_frame_count = expected_references;
+            if (roundtrip)
+                throw std::runtime_error("direct dump import has no verified save/reopen mapping yet");
+        } else {
+            if (save_probe || roundtrip) editor_import::require_mask_fixture(references);
+            input = editor_import::write_dump(project, references);
+            expected_references = references.Size();
+        }
         inspect = [&, input](DWORD pid) {
             stage = L"import";
-            editor_import::operate(pid, input, deadline, diagnostics);
+            if (!reopen_export_probe)
+                editor_import::operate(pid, input, expected_references, deadline, diagnostics);
+            else
+                editor_import::reopen_and_export(pid, project, expected_references, deadline, previous, diagnostics);
             if (save_probe || roundtrip) {
                 stage = L"mask-assignment";
-                editor_import::apply_fixture_mask(pid, deadline, diagnostics);
+                if (!has_dump) editor_import::apply_fixture_mask(pid, deadline, diagnostics);
                 stage = L"first-save";
                 previous = editor_import::first_save(pid, project, deadline);
             }
         };
+        if (reopen_export_probe) {
+            if (!has_dump)
+                throw std::runtime_error("reopen/export probe requires the locked direct dump identity");
+            previous = editor_import::existing_save_times(project);
+        }
     }
     stage = L"registry-transaction";
     require_editor_stopped();
@@ -842,10 +884,17 @@ int preflight(JsonObject const& request, JsonObject const& diagnostics, bool lau
         return finish_roundtrip(software(), journal, paths, editor, project, config, duration, deadline,
                                 previous, references, diagnostics, stage);
     }
+    if (reopen_export_probe) {
+        stage = L"reopen-export-validation";
+        auto result = editor_import::inspect_direct_project(editor, project, config, direct_frame_count, diagnostics);
+        std::cout << to_string(result.Stringify()) << '\n';
+        return 0;
+    }
     if (save_probe)
-        return failure(L"save-observation", L"Editor saved the shared-mask fixture", diagnostics);
+        return failure(L"save-observation", has_dump ? L"Editor saved the locked native-dump project"
+                                                     : L"Editor saved the shared-mask fixture", diagnostics);
     if (import_probe)
-        return failure(L"import-observation", L"Editor imported three references; no round-trip manifest", diagnostics);
+        return failure(L"import-observation", L"Editor imported requested references; no round-trip manifest", diagnostics);
     return failure(L"startup-observation", L"Bounded startup ended; see the observed process and windows", diagnostics);
 }
 
@@ -895,11 +944,12 @@ int main(int argc, char** argv) {
                 bool import_probe = argc == 2 && std::string_view(argv[1]) == "--import-probe";
                 bool save_probe = argc == 2 && std::string_view(argv[1]) == "--save-probe";
                 bool roundtrip = argc == 2 && std::string_view(argv[1]) == "--roundtrip";
-                bool launch = import_probe || save_probe || roundtrip ||
+                bool reopen_export_probe = argc == 2 && std::string_view(argv[1]) == "--reopen-export-probe";
+                bool launch = import_probe || save_probe || roundtrip || reopen_export_probe ||
                     (argc == 2 && std::string_view(argv[1]) == "--startup-preflight");
                 if (argc != 1 && !launch) throw std::runtime_error("unknown editor bridge option");
                 return preflight(JsonObject::Parse(to_hstring(read_request())), diagnostics,
-                    launch, journal, open_software, stage, import_probe, save_probe, roundtrip);
+                    launch, journal, open_software, stage, import_probe, save_probe, roundtrip, reopen_export_probe);
             });
         } catch (hresult_error const& error) {
             return failure(stage, error.message(), diagnostics);

@@ -17,6 +17,7 @@ from jsonschema import Draft202012Validator, ValidationError
 from dmd_optimizer.adapters.editor import (
     EditorBridgeError,
     Reference,
+    serialize_dump_import_request,
     serialize_request,
     stage_editor,
     write_project,
@@ -24,7 +25,7 @@ from dmd_optimizer.adapters.editor import (
 from scripts.lock_profile import Profile, RomMember, _read_profile
 
 
-PINNED_DECODER = "da71fa73e838ab3e257a2a73c8f74d88a3336615930761fa494a251822e0c2d5"
+PINNED_DECODER = "b39a1ef00f4f4c68c73d2b3ffe26521a6f95af16d44b3bcf2e2d2560d65bcdcd"
 TEXTURE = "textures/chiffres.raw"
 TEXTURE_LOCK = {"size": 1815, "sha256": "9eeea44b769035c9e49fe2fe90afa1463e047073384da0411c1c7e8e9a3f9a97"}
 
@@ -860,6 +861,17 @@ def test_stages_only_profile_files_and_exact_source_tree_decoder(
     assert hashlib.sha256((staged / TEXTURE).read_bytes()).hexdigest() == TEXTURE_LOCK["sha256"]
 
 
+def test_stage_allows_the_profile_declared_verified_decoder(installed_artifacts, profile, tmp_path):
+    source, _ = installed_artifacts
+    decoder = profile.components["bundled decoder"]
+    declared = Path(decoder["provenance"]["installation_path"]) / Path(decoder["binary"]).name
+    assert hashlib.sha256(declared.read_bytes()).hexdigest() == PINNED_DECODER
+
+    staged = stage_editor(source, tmp_path / "stage", profile, decoder_path=declared)
+
+    assert hashlib.sha256((staged / "serum64.dll").read_bytes()).hexdigest() == PINNED_DECODER
+
+
 def test_rejects_installed_adjacent_decoder_before_launch(
     installed_artifacts, case, profile, tmp_path,
 ):
@@ -916,6 +928,41 @@ def test_serialized_request_preserves_order_pixels_and_masks(
     assert a["ignore_sha256"] == b["ignore_sha256"] == hashlib.sha256(case[0].ignore_bitmap).hexdigest()
     assert c["ignore_bitmap"] is None
     assert c["ignore_sha256"] is None
+
+
+def test_dump_import_request_preserves_the_original_dump_without_frame_json(
+    profile, tmp_path, monkeypatch, bridge_schema,
+):
+    staged = tmp_path / "stage"
+    staged.mkdir()
+    dump = tmp_path / "twst_405.txt"
+    source = b"0x00000000\r\n" + b"0" * 128 + b"\r\n\r\n"
+    dump.write_bytes(source)
+    monkeypatch.setattr("dmd_optimizer.adapters.editor._verify_staged_file", lambda *_: None)
+
+    request = json.loads(serialize_dump_import_request(
+        tmp_path / "project", dump, 1, profile, editor_root=staged,
+        config_root=tmp_path / "config", deadline_ms=1_500,
+    ))
+
+    bridge_schema.validate(request)
+    assert request["dump_path"] == str(dump.resolve())
+    assert request["dump_sha256"] == hashlib.sha256(source).hexdigest()
+    assert request["expected_import_count"] == 1
+    assert "references" not in request
+
+
+def test_dump_import_request_rejects_missing_or_empty_dump(profile, tmp_path, monkeypatch):
+    staged = tmp_path / "stage"
+    staged.mkdir()
+    monkeypatch.setattr("dmd_optimizer.adapters.editor._verify_staged_file", lambda *_: None)
+    with pytest.raises(EditorBridgeError, match="dump file is missing"):
+        serialize_dump_import_request(tmp_path / "project", tmp_path / "missing.txt", 1, profile,
+                                      editor_root=staged)
+    empty = tmp_path / "empty.txt"
+    empty.touch()
+    with pytest.raises(EditorBridgeError, match="dump file is empty"):
+        serialize_dump_import_request(tmp_path / "project", empty, 1, profile, editor_root=staged)
 
 
 def test_write_project_expects_missing_bridge_after_validation(
@@ -1266,6 +1313,37 @@ def test_real_three_reference_import(installed_artifacts, locked_profile, case):
         assert timestamp.startswith(b"0x") and len(rows) == 32
         assert all(len(row) == 128 for row in rows)
         assert bytes(value - ord("0") for value in b"".join(rows)) == ref.native_pixels
+
+
+def test_bridge_import_source_allows_more_than_fixture_count():
+    source = (Path(__file__).resolve().parents[2] / "native" / "editor_import_probe.h").read_text(encoding="utf-8")
+    assert "import probe requires three references" not in source
+    assert "references.Size() > 65535" in source
+
+
+def test_bridge_import_source_supports_a_locked_direct_dump():
+    source = (Path(__file__).resolve().parents[2] / "native" / "editor_bridge.cpp").read_text(encoding="utf-8")
+    assert 'request_path(request, L"dump_path")' in source
+    assert 'GetNamedString(L"dump_sha256")' in source
+    assert "expected_import_count" in source
+
+
+def test_bridge_direct_dump_save_does_not_require_the_three_frame_mask_fixture():
+    source = (Path(__file__).resolve().parents[2] / "native" / "editor_bridge.cpp").read_text(encoding="utf-8")
+    assert 'if (roundtrip)\n                throw std::runtime_error("direct dump import has no verified save/reopen mapping yet")' in source
+
+
+def test_bridge_direct_dump_project_has_a_fresh_reopen_export_probe():
+    source = (Path(__file__).resolve().parents[2] / "native" / "editor_bridge.cpp").read_text(encoding="utf-8")
+    inspector = (Path(__file__).resolve().parents[2] / "native" / "editor_roundtrip.h").read_text(encoding="utf-8")
+    assert '"--reopen-export-probe"' in source
+    assert "inspect_direct_project" in source
+    assert "expected{80, 128, 32, 256, 64, expected_frames, 4, 0, 0}" in inspector
+
+
+def test_bridge_inventory_failure_reports_its_actual_digest():
+    source = (Path(__file__).resolve().parents[2] / "native" / "editor_bridge.cpp").read_text(encoding="utf-8")
+    assert "actual staged editor inventory SHA-256:" in source
 
 
 @pytest.mark.skipif(os.environ.get("DMD_EDITOR_SAVE_PROBE") != "1",

@@ -112,6 +112,10 @@ project.
 validates Task 1 geometry/shades, serializes the bridge request, records the
 bridge manifest, and offers reopen/export inspection used by integration tests.
 
+This bridge is limited to the synthetic Task 2 fixture. It must not import the
+fixed Twister dump, generate a substitute dump, or become part of the normal
+ColorizingDMD authoring workflow.
+
 The bridge test fixture has exactly three distinct 128×32 row-major native
 pixel frames with shades 0–3. `Reference` IDs are unique and nonempty; their
 optional same-sized binary comparison bitmap uses `1 = ignore`, and all three

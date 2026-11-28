@@ -34,17 +34,29 @@ def case(tmp_path_factory):
     return oracle, variant(tmp_path_factory.mktemp("native") / "diagnostic", "original", "ABC"), Profile(**record, profile_sha256=digest)
 
 
-def test_unmodified_editor_export_is_incompatible(case):
-    api, _, profile = case
-    golden = ProjectFiles(GOLD, GOLD / "references.json", GOLD / "twst_405.cRZ", {})
-    with pytest.raises(api.IncompatibleExport, match="byte 102"):
-        list(api.replay(golden, [api.Frame(A)], profile))
-
-
 requires_decoder = pytest.mark.skipif(
     not os.environ.get("DMD_EDITOR_DECODER_PATH"),
     reason="set DMD_EDITOR_DECODER_PATH and build the x64 serum_worker for native qualification",
 )
+
+
+@requires_decoder
+def test_unmodified_editor_export_matches_all_references(case):
+    api, _, profile = case
+    golden = ProjectFiles(GOLD, GOLD / "references.json", GOLD / "twst_405.cRZ", {})
+    matches = list(api.replay(golden, [api.Frame(A), api.Frame(B), api.Frame(C)], profile))
+    assert [match.reference for match in matches] == ["A", "B", "C"]
+    assert [(match.output.result, match.output.flags, match.output.trigger,
+             match.output.rotation_timer, match.output.width) for match in matches] == [
+        (0, 1, 0xffffffff, 0, 128),
+        (0, 1, 0xffffffff, 0, 128),
+        (0, 1, 0xffffffff, 0, 128),
+    ]
+    assert [match.output.pixels_sha256 for match in matches] == [
+        "2dba690b2eff472e10f084556e8036333dbba7eac767715ea4e41f0378cc12b3",
+        "157827e58c2ce146718f81e456e409eb357e73231d0c71d2cfe9109e6effc1cd",
+        "23303d1ff92d7fb92ac35fde5828d9c55e9ab2b2352f7d364b7c8b14dfd5f83c",
+    ]
 
 
 @requires_decoder
@@ -83,6 +95,9 @@ def variant(folder, mode, names):
     if mode == "hidden":
         crom[124:4220] = bytes([1]) * 4096
         hashes = [0, 0, zlib.crc32(C)]
+    elif mode == "legacy":
+        crom = crom[:102] + crom[106:]
+        hashes = [zlib.crc32(A), zlib.crc32(B), zlib.crc32(C)]
     elif mode == "original":
         hashes = [0xb52ee996, 0xde0c37ff, 0xf57d4265]
     else:
@@ -98,13 +113,20 @@ def variant(folder, mode, names):
         crom[4223+ordinal*8192:4223+(ordinal+1)*8192] = colors[old]
     export = folder / "twst_405.cRZ"
     with zipfile.ZipFile(export, "w", zipfile.ZIP_DEFLATED) as package:
-        # Match the decoder's 102-byte header in this synthetic diagnostic copy only.
-        package.writestr(zipfile.ZipInfo("twst_405.cRom"), crom[:102] + crom[106:], compress_type=zipfile.ZIP_DEFLATED)
+        package.writestr(zipfile.ZipInfo("twst_405.cRom"), crom, compress_type=zipfile.ZIP_DEFLATED)
     manifest = {"references": [{"id": n, "ordinal": i} for i, n in enumerate(names)],
                 "runtime_export": export.name, "files": [{"path": export.name, "sha256": hashlib.sha256(export.read_bytes()).hexdigest()}]}
     sidecar = folder / "references.json"
     sidecar.write_text(json.dumps(manifest))
     return ProjectFiles(folder, sidecar, export, {})
+
+
+@requires_decoder
+def test_rejects_legacy_102_byte_header(case, tmp_path):
+    api, _, profile = case
+    legacy = variant(tmp_path / "legacy", "legacy", "ABC")
+    with pytest.raises(api.IncompatibleExport, match="byte 106"):
+        list(api.replay(legacy, [api.Frame(A)], profile))
 
 
 @pytest.mark.parametrize("mode,names,frames,expected", [

@@ -40,6 +40,7 @@ class Profile:
     delivery_semantics: str | None
     rom_sha256: str
     dump_sha256: str
+    dump_format: dict[str, object]
     rom_members: tuple[RomMember, ...]
     components: dict[str, dict]
     profile_sha256: str
@@ -214,6 +215,12 @@ def _validate_profile(record):
            "a nonempty string or null", name)
     for field in ("rom_sha256", "dump_sha256"):
         _field(record, field, lambda value: _hex(value, 64), "a lowercase SHA-256 digest", name)
+    dump_format = _field(record, "dump_format", lambda value: isinstance(value, dict), "an object", name)
+    _field(dump_format, "grammar", lambda value: value == "timestamped-text-v1", "timestamped-text-v1", "dump_format")
+    _field(dump_format, "tick_bits", lambda value: value == 32, "32", "dump_format")
+    _field(dump_format, "tick_unit", lambda value: value is None or value == "milliseconds", "null or milliseconds", "dump_format")
+    _field(dump_format, "discontinuity_policy", lambda value: value == "split-unknown", "split-unknown", "dump_format")
+    _field(dump_format, "timing_evidence", _string_list, "a list of nonempty strings", "dump_format")
     _field(record, "rom_members", lambda value: isinstance(value, list) and bool(value),
            "a nonempty list of ROM members", name)
 
@@ -232,7 +239,7 @@ def _validate_profile(record):
             raise ProfileError(f"{name}: {field} differs from ColorizingDMD editor")
     source_version = _field(decoder, "source_version", _nonempty_string, "a nonempty string", name)
     source_tree_version = _field(decoder, "source_tree_binary_version", _nonempty_string, "a nonempty string", name)
-    if decoder.get("provenance", {}).get("kind") == "source-tree" and source_version != source_tree_version:
+    if source_version != source_tree_version:
         raise ProfileError(f"{name}: source_version {source_version} differs from source_tree_binary_version {source_tree_version}")
 
 
@@ -283,7 +290,7 @@ def inspect_fixtures(rom: Path, dump: Path) -> Profile:
         width=record["width"],
         height=record["height"], native_shades=record["native_shades"],
         delivery_semantics=record["delivery_semantics"], rom_sha256=rom_sha256,
-        dump_sha256=dump_sha256, rom_members=members, components=record["components"],
+        dump_sha256=dump_sha256, dump_format=record["dump_format"], rom_members=members, components=record["components"],
         profile_sha256=digest,
     )
 

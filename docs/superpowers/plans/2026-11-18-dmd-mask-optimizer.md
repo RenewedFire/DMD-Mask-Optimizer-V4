@@ -190,11 +190,11 @@ Use the task order below as the default. Tasks 2 and 4 can proceed independently
 
 **Interface:** `publish(result: SolveResult, revision: Revision, folder: Path) -> ExportRecord`
 
-**Inputs:** Tasks 2–3 native bridge/replay and Tasks 5–10 immutable inputs, options and coverage.
+**Inputs:** Tasks 2–3 staged-editor/runtime verification and Tasks 5–10 immutable inputs, options and coverage. The bridge supplies only the fixed dump's native path/digest/count to the editor; it never transports derived frame data.
 
 - [ ] Write `test_export` and its fixtures. Start with `assert case.wrong_family_matches == 0 and case.mapped_occurrences == case.input_occurrences and case.author_edit_preserved`. Add the failure cases described below.
 - [ ] Run `python -m pytest tests/integration/test_export.py -q` and confirm a failure attributable to the missing behavior.
-- [ ] Implement the interface. Compile final slots/indices in a sibling staging directory. Reopen/save/export with the real editor, reload final runtime bytes and replay ordered sessions, repeats, held-out cases, unknowns and domain variants. Check stable IDs after reordering. Write masks.json, mask previews, raw references and previews, frame_mapping.csv, optimization.json, coverage.json and report.html. Include all input occurrences with assignment or omission reason. Hash files, reconcile mapping and publish atomically under a fresh run directory.
+- [ ] Implement the interface. Compile final slots/indices in a sibling staging directory. Use the staged editor's native TXT import with the original fixed dump path, then reopen/save/export, reload final runtime bytes and replay ordered sessions, repeats, held-out cases, unknowns and domain variants. Check stable IDs after reordering. Write masks.json, mask previews, raw references and previews, frame_mapping.csv, optimization.json, coverage.json and report.html. Include all input occurrences with assignment or omission reason. Hash files, reconcile mapping and publish atomically under a fresh run directory. Do not send reconstructed frames, masks, or timestamps through the bridge.
 - [ ] Rerun `python -m pytest tests/integration/test_export.py -q`. Require all assertions to pass. Try full scope, then a valid strict subset with explicit omissions checked against retained rules. Otherwise publish diagnostic/source outputs. Test disk or reopen failure, known negatives outside the subset, final artifact digest, equivalent repeated exports and preservation of existing author edits.
 - [ ] Record the evidence and checkpoint the task under the working convention above.
 

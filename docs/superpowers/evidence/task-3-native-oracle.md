@@ -1,16 +1,16 @@
 ﻿# Task 3 native replay evidence
 
-**The original three-reference export fails recognition with the pinned Serum 2.1.0 DLL.** Task 3 native certification remains open. The oracle verifies the archive and checks the decoder layout before launch. Passing diagnostic runs use separately identified synthetic files.
+**The untouched three-reference editor export is qualified with the editor's installed Serum 2.3.1 decoder.** The oracle stages the manifest-verified export without changing its archive or cROM member before native replay.
 
 ## Editor and decoder layout
 
-The committed `twst_405.cRZ` at `1e65ed6` has SHA-256 `06c2c489aae7d55fec68e1648b88192c842d3ac30bd114201487c48d49df5271`. The pinned DLL has SHA-256 `da71fa73e838ab3e257a2a73c8f74d88a3336615930761fa494a251822e0c2d5` and returns version `2.1.0`.
+The committed `twst_405.cRZ` at `1e65ed6` has SHA-256 `06c2c489aae7d55fec68e1648b88192c842d3ac30bd114201487c48d49df5271`. The matched decoder is `C:\DMD Colorization\ColorizingDMD\serum64.dll`, SHA-256 `b39a1ef00f4f4c68c73d2b3ffe26521a6f95af16d44b3bcf2e2d2560d65bcdcd`, and returns version `2.3.1`. The same digest was independently found in the original editor installation. The project lock identifies it as a local installed binary; it makes no unsupported source-tree-binary claim.
 
-The editor writes a four-byte `is256x64` after the two-byte background count. Its hashes start at byte 106. The decoder reads the first hash at 102, interprets bytes 114 through 116 as shape modes 101, 66 and 125, and reads 245 as the first mask slot in a one-mask file. A direct isolated probe of the original export returned a valid load handle. Colorizing the first reference produced a native read fault in one run and no reported match in another. A successful load alone does not qualify this export. [Pinned editor serializer](https://github.com/SerumColor/ColorizingDMD/blob/37216912eecfb0cebf1e8c2e816d350d33f5e62d/ColorizingDMD.cpp) and [decoder array reader and Identify_Frame](https://github.com/SerumColor/ColorizingDMD/blob/37216912eecfb0cebf1e8c2e816d350d33f5e62d/serum-decode.cpp).
+The editor writes a four-byte `is256x64` after the two-byte background count, so its hashes start at byte 106. The 2.3.1 paired decoder recognizes the exact archive: A, B, and C all report `frameID`, result `0`, flags `1`, trigger `ffffffff`, rotation timer `0`, and width `128`. Their rendered RGB565 SHA-256 values are respectively `2dba690b2eff472e10f084556e8036333dbba7eac767715ea4e41f0378cc12b3`, `157827e58c2ce146718f81e456e409eb357e73231d0c71d2cfe9109e6effc1cd`, and `23303d1ff92d7fb92ac35fde5828d9c55e9ab2b2352f7d364b7c8b14dfd5f83c`. The prior source-tree 2.1.0 DLL (SHA-256 `da71fa73e838ab3e257a2a73c8f74d88a3336615930761fa494a251822e0c2d5`) instead reads hashes at byte 102 and is deliberately rejected by the revised profile. [Pinned editor serializer](https://github.com/SerumColor/ColorizingDMD/blob/37216912eecfb0cebf1e8c2e816d350d33f5e62d/ColorizingDMD.cpp) and [decoder array reader and Identify_Frame](https://github.com/SerumColor/ColorizingDMD/blob/37216912eecfb0cebf1e8c2e816d350d33f5e62d/serum-decode.cpp).
 
-For the diagnostic control, the test removes bytes 102 through 105 from a copy of the unpacked synthetic fixture and repacks one member with a fixed ZIP timestamp. The resulting archive SHA-256 is `50af8c7e115cd74744c030f2be4f0e1d0b9ca5d6d8efda6b295ac2a4c4bbf73c`. This change was tested only on this generated file. The production replay API always stages the exact export from the caller's manifest. The incompatible original fails preflight.
+The synthetic diagnostics preserve the editor's 106-byte header. They vary only generated cROM test inputs such as masks and reference ordering. Production replay always stages the exact export from the caller's manifest.
 
-## Native observations on the diagnostic control
+## Native observations
 
 The worker loads one verified DLL, requests both resolutions as the editor does, and records the 128 by 32 RGB565 plane. Observer mode also reads the public tester `frameID`. A separate production-mode process omits that read. Both modes produced identical result words, flags, triggers, rotation timers, widths, and hashes of emitted 32p frames across all five traces. The seed pictures supply distinct visible output. Rendered RGB565 SHA-256 prefixes for A, B and C were `2dba690b2eff`, `157827e58c2c`, and `23303d1ff92d`. [Public tester ABI](https://github.com/SerumColor/ColorizingDMD/blob/37216912eecfb0cebf1e8c2e816d350d33f5e62d/serum.h).
 
@@ -32,7 +32,7 @@ Flipping the low bit at offsets 0, 6, 9, 10, 16, 20, 21, 22, 24, 25, 27, 28, 30,
 
 ## Reproduction
 
-From an x64 MSVC developer shell, compile the worker into the repository artifacts directory. Set `DMD_EDITOR_DECODER_PATH` to the source-tree DLL from the profile. The default worker location is shown below. `DMD_SERUM_WORKER` can select a different built worker.
+From an x64 MSVC developer shell, compile the worker into the repository artifacts directory. Set `DMD_EDITOR_DECODER_PATH` to the verified Serum 2.3.1 DLL above. The default worker location is shown below. `DMD_SERUM_WORKER` can select a different built worker.
 
 ```powershell
 New-Item -ItemType Directory -Force artifacts/oracle | Out-Null
@@ -40,4 +40,4 @@ cl /nologo /std:c++17 /EHsc /O2 /Foartifacts/oracle/serum_worker.obj native/seru
 python -m pytest -q tests/integration/test_oracle.py -p no:cacheprovider --basetemp=artifacts/oracle/pytest
 ```
 
-The first test run reported the missing oracle module. The final focused run exercised all nine cases, including malformed packets, input validation, shutdown, and a timed-out child alongside a healthy worker. Logs, worker build command, binary, export and source fingerprints, input hashes and event-by-event comparison results are in `artifacts/oracle-qualification`. The tests verify real elapsed-time waits with native rotation calls on these static frames. Animated scene timing and end-to-end playback of an original editor export remain unqualified.
+The final focused run exercised all ten cases, including the unchanged export, explicit rejection of the legacy 102-byte header, semantic traces, malformed packets, input validation, shutdown, and a timed-out child alongside a healthy worker. The tests verify real elapsed-time waits with native rotation calls on static frames. Animated scene timing and end-to-end playback beyond those static traces remain unqualified.

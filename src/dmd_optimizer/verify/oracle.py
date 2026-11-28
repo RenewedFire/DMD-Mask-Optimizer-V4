@@ -1,4 +1,4 @@
-"""Replay the Twister normal-comparison profile against an isolated Serum 2.1.0 DLL."""
+"""Replay the Twister normal-comparison profile against an isolated Serum 2.3.1 DLL."""
 
 import hashlib
 import io
@@ -98,17 +98,18 @@ def _package(project, profile):
     if ((version, width, height, width_x, height_x, shades) != (80, 128, 32, 256, 64, 4)
             or not 1 <= count <= 65535 or masks > 64 or sprites or backgrounds):
         raise IncompatibleExport("unsupported cROM dimensions, counts or format")
-    start = 102 + 4 * count
+    # Serum 2.3.1 writes the four-byte is256x64 field after background_count.
+    start = 106 + 4 * count
     shape = crom[start:start + count]
     slots = crom[start + count:start + 2 * count]
     if len(slots) != count or any(shape) or any(s != 255 and s >= masks for s in slots):
-        raise IncompatibleExport("invalid shape or slot table with Serum 2.1.0 hashes at byte 102")
+        raise IncompatibleExport("invalid shape or slot table with Serum 2.3.1 hashes at byte 106")
     # Size of Serum_LoadNewFile's serialized arrays for this sprite-free,
     # background-free profile. The editor can append six shadow bytes per set.
     plane_pixels = PIXELS + width_x * height_x
     per_reference = (6 + 1 + 4 * plane_pixels + 2 * 2 * 32 * shades
                      + 32 + 1 + 2 * 2 * 64 * 4 + 4 + 2 * 32 * 4 + 2)
-    base_size = 102 + masks * PIXELS + count * per_reference
+    base_size = 106 + masks * PIXELS + count * per_reference
     if len(crom) not in (base_size, base_size + count * 32 * 6):
         raise IncompatibleExport("file length differs from Serum 2.1.0 array layout")
     refs = manifest["references"]
@@ -129,11 +130,11 @@ class Worker:
         self.instrument = instrument
         dll_path = os.environ.get("DMD_EDITOR_DECODER_PATH")
         if not dll_path:
-            raise ValueError("set DMD_EDITOR_DECODER_PATH to the source-tree Serum 2.1.0 DLL")
+            raise ValueError("set DMD_EDITOR_DECODER_PATH to the verified Serum 2.3.1 DLL")
         dll = Path(dll_path).resolve(strict=True)
         if (profile.components["bundled decoder"]["sha256"] != _DECODER_SHA256
-                or profile.components["bundled decoder"]["source_tree_binary_version"] != "2.1.0"):
-            raise ValueError("source-tree Serum 2.1.0 profile SHA-256 or version mismatch")
+                or profile.components["bundled decoder"]["source_tree_binary_version"] != "2.3.1"):
+            raise ValueError("verified Serum 2.3.1 profile SHA-256 or version mismatch")
         worker = Path(os.getenv("DMD_SERUM_WORKER", ROOT / "artifacts/oracle/serum_worker.exe")).resolve(strict=True)
         self.folder = ROOT / "artifacts" / "oracle" / uuid.uuid4().hex
         (self.folder / "twst_405").mkdir(parents=True)

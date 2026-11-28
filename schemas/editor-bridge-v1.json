@@ -39,12 +39,12 @@
       "additionalProperties": false,
       "required": [
         "schema_version", "editor_root", "expected_decoder_sha256", "project_root", "config_root",
-        "deadline_ms", "width", "height", "native_shades", "references"
+        "deadline_ms", "width", "height", "native_shades"
       ],
       "properties": {
         "schema_version": { "const": 1 },
         "editor_root": { "$ref": "#/$defs/path", "description": "Absolute path to the isolated, verified editor tree." },
-        "expected_decoder_sha256": { "const": "da71fa73e838ab3e257a2a73c8f74d88a3336615930761fa494a251822e0c2d5" },
+        "expected_decoder_sha256": { "const": "b39a1ef00f4f4c68c73d2b3ffe26521a6f95af16d44b3bcf2e2d2560d65bcdcd" },
         "project_root": { "$ref": "#/$defs/path", "description": "Absolute path to the generated project directory." },
         "config_root": { "$ref": "#/$defs/path", "description": "Absolute path to the isolated editor configuration and autosave directory." },
         "deadline_ms": { "type": "integer", "minimum": 1 },
@@ -56,8 +56,21 @@
           "type": "array",
           "minItems": 1,
           "items": { "$ref": "#/$defs/inputReference" }
+        },
+        "dump_path": { "$ref": "#/$defs/path", "description": "Immutable native TXT dump supplied directly to ColorizingDMD." },
+        "dump_sha256": { "$ref": "#/$defs/sha256" },
+        "expected_import_count": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      },
+      "oneOf": [
+        {
+          "required": ["references"],
+          "not": { "anyOf": [{ "required": ["dump_path"] }, { "required": ["dump_sha256"] }, { "required": ["expected_import_count"] }] }
+        },
+        {
+          "required": ["dump_path", "dump_sha256", "expected_import_count"],
+          "not": { "required": ["references"] }
         }
-      }
+      ]
     },
     "companionFile": {
       "type": "object",

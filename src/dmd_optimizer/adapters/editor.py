@@ -16,7 +16,7 @@ from scripts.lock_profile import (
 )
 
 
-_DECODER_SHA256 = "da71fa73e838ab3e257a2a73c8f74d88a3336615930761fa494a251822e0c2d5"
+_DECODER_SHA256 = "b39a1ef00f4f4c68c73d2b3ffe26521a6f95af16d44b3bcf2e2d2560d65bcdcd"
 _EDITOR = "ColorizingDMD editor"
 _DECODER = "bundled decoder"
 _TEXTURE_INSTALLATION = Path(STARTUP_ASSET_SOURCE)
@@ -52,14 +52,14 @@ def _editor_files(profile: Profile):
     editor = profile.components[_EDITOR]
     decoder = profile.components[_DECODER]
     if decoder["sha256"] != _DECODER_SHA256:
-        raise EditorBridgeError(f"{_DECODER}: profile must pin source-tree Serum 2.1.0 ({_DECODER_SHA256})")
+        raise EditorBridgeError(f"{_DECODER}: profile must pin the verified installed Serum 2.3.1 ({_DECODER_SHA256})")
 
     toolchain_editor = Path(editor["binary"]).parent
     records = [(editor["binary"], editor, _EDITOR)]
     for path, lock in editor["dependencies"].items():
         records.append((path, lock if isinstance(lock, dict) else {"sha256": lock},
                         f"{_EDITOR} dependency {path}"))
-    # The pinned DLL reports its 2.1.0 identity via Serum_GetVersion and has
+    # The pinned DLL reports its 2.3.1 identity via Serum_GetVersion and has
     # no Windows VERSIONINFO resource. Its exact digest identifies those bytes.
     decoder_lock = {"sha256": _DECODER_SHA256, "architecture": "x64"}
     records.append((decoder["binary"], decoder_lock, _DECODER))
@@ -129,6 +129,10 @@ def stage_editor(
     if not source.is_dir():
         raise EditorBridgeError(f"editor source root is missing: {source}")
     files = _editor_files(profile)
+    decoder = profile.components[_DECODER]
+    declared_decoder = (
+        Path(decoder["provenance"]["installation_path"]).resolve() / Path(decoder["binary"]).name
+    )
 
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -137,9 +141,9 @@ def stage_editor(
             staging.mkdir()
             for relative, lock, name in files:
                 origin = decoder_path if name == _DECODER and decoder_path is not None else source / relative
-                if name == _DECODER and origin.resolve() in {
+                if (name == _DECODER and origin.resolve() in {
                     protected / relative for protected in installations
-                }:
+                } and origin.resolve() != declared_decoder):
                     raise EditorBridgeError("bundled decoder must come from the separate source-tree lock")
                 if "size" in lock:
                     origin = _TEXTURE_INSTALLATION.resolve() / relative
@@ -196,17 +200,10 @@ def _encode_references(refs: Sequence[Reference], profile: Profile) -> list[dict
     return encoded
 
 
-def serialize_request(
-    folder: Path,
-    refs: Sequence[Reference],
-    profile: Profile,
-    *,
-    editor_root: Path | None = None,
-    config_root: Path | None = None,
-    deadline_ms: int = 60_000,
-) -> str:
-    """Validate generated references and a staged editor, then encode a v1 request."""
-    references = _encode_references(refs, profile)
+def _request_base(
+    folder: Path, profile: Profile, *, editor_root: Path | None, config_root: Path | None,
+    deadline_ms: int,
+) -> dict[str, object]:
     if editor_root is None or not editor_root.is_dir():
         raise EditorBridgeError(f"staged editor root is missing: {editor_root}")
     if type(deadline_ms) is not int or deadline_ms <= 0:
@@ -230,7 +227,7 @@ def serialize_request(
     _check_asset_source(profile)
     for relative, lock, name in _editor_files(profile):
         _verify_staged_file(editor / relative, lock, name)
-    return json.dumps({
+    return {
         "schema_version": 1,
         "editor_root": str(editor),
         "expected_decoder_sha256": _DECODER_SHA256,
@@ -240,8 +237,48 @@ def serialize_request(
         "width": profile.width,
         "height": profile.height,
         "native_shades": profile.native_shades,
-        "references": references,
+    }
+
+
+def serialize_request(
+    folder: Path,
+    refs: Sequence[Reference],
+    profile: Profile,
+    *,
+    editor_root: Path | None = None,
+    config_root: Path | None = None,
+    deadline_ms: int = 60_000,
+) -> str:
+    """Validate generated references and a staged editor, then encode a v1 request."""
+    references = _encode_references(refs, profile)
+    request = _request_base(folder, profile, editor_root=editor_root, config_root=config_root,
+                            deadline_ms=deadline_ms)
+    request["references"] = references
+    return json.dumps(request)
+
+
+def serialize_dump_import_request(
+    folder: Path, dump_path: Path, expected_import_count: int, profile: Profile, *,
+    editor_root: Path | None = None, config_root: Path | None = None, deadline_ms: int = 60_000,
+) -> str:
+    """Encode a native ColorizingDMD TXT import without recreating its frames."""
+    source = Path(dump_path).resolve()
+    if not source.is_file():
+        raise EditorBridgeError(f"dump file is missing: {source}")
+    if source.stat().st_size == 0:
+        raise EditorBridgeError(f"dump file is empty: {source}")
+    if type(expected_import_count) is not int or not 1 <= expected_import_count <= 65_535:
+        raise EditorBridgeError("expected import count must be between 1 and 65535")
+    with source.open("rb") as stream:
+        digest = hashlib.file_digest(stream, "sha256").hexdigest()
+    request = _request_base(folder, profile, editor_root=editor_root, config_root=config_root,
+                            deadline_ms=deadline_ms)
+    request.update({
+        "dump_path": str(source),
+        "dump_sha256": digest,
+        "expected_import_count": expected_import_count,
     })
+    return json.dumps(request)
 
 
 def write_project(
